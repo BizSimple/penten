@@ -17,14 +17,18 @@ Local CI Pentesting
 
 ### Usage
 ```bash
-python penten_cli.py \
+python penten_cli.py scan \
   --url http://localhost:3000 \
   --provider ollama \
   --model llama3.1 \
   --max-pages 50 \
   --max-payloads-per-path 3 \
-  --ollama-url http://127.0.0.1:11434 \
   --output-dir ./scan-results
+```
+
+### Configure provider token vault
+```bash
+python penten_cli.py configure --provider deepseek
 ```
 
 ### Requirements
@@ -32,14 +36,21 @@ python penten_cli.py \
 - `playwright` installed and browser runtime available
 - `trufflehog` available in PATH (optional but recommended)
 - AI payload provider:
-  - **Ollama** (`--provider ollama`): local API on `http://127.0.0.1:11434`
+  - **Ollama** (`--provider ollama`): default URL `http://127.0.0.1:11434`
     - Optional env vars: `OLLAMA_URL` (preferred) or `OLLAMA_API_URL`
+    - Optional override per run: `--provider-url`
   - **DeepSeek** (`--provider deepseek`): model via `/chat/completions`
-    - API key via `--api-key` or `DEEPSEEK_API_KEY`
+    - API key via `python penten_cli.py configure --provider deepseek`
+    - Env var override: `DEEPSEEK_API_KEY`
+    - Vault file default: `~/.penten/vault.json` (override with `--vault-file`)
     - Optional base URL override via `--provider-url` or `DEEPSEEK_API_URL`
   - **GLM / z.ai** (`--provider glm`): model via `/chat/completions`
-    - API key via `--api-key` or `GLM_API_KEY` (or `ZAI_API_KEY`)
+    - API key via `python penten_cli.py configure --provider glm`
+    - Env var override: `GLM_API_KEY` (or `ZAI_API_KEY`)
+    - Vault file default: `~/.penten/vault.json` (override with `--vault-file`)
     - Optional base URL override via `--provider-url` or `GLM_API_URL`
   - **Gemini** (`--provider gemini`): model via `:generateContent`
-    - API key via `--api-key` or `GEMINI_API_KEY`
+    - API key via `python penten_cli.py configure --provider gemini`
+    - Env var override: `GEMINI_API_KEY`
+    - Vault file default: `~/.penten/vault.json` (override with `--vault-file`)
     - Optional base URL override via `--provider-url` or `GEMINI_API_URL`

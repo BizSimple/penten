@@ -1,13 +1,19 @@
 import unittest
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from penten_cli import (
+    build_parser,
     build_registration_value,
+    configure_provider,
     generate_ai_payloads,
     is_internal_url,
+    load_vault,
     path_from_url,
     resolve_provider_api_key,
     resolve_provider_url,
+    save_vault,
     validate_local_url,
 )
 
@@ -120,26 +126,49 @@ class ProviderPayloadTests(unittest.TestCase):
         )
 
     def test_resolve_provider_url(self) -> None:
-        self.assertEqual(
-            resolve_provider_url("ollama", "", "http://127.0.0.1:11434"),
-            "http://127.0.0.1:11434",
-        )
-        self.assertEqual(resolve_provider_url("deepseek", "", "http://unused"), "https://api.deepseek.com")
-        self.assertEqual(
-            resolve_provider_url("glm", "", "http://unused"),
-            "https://open.bigmodel.cn/api/paas/v4",
-        )
-        self.assertEqual(
-            resolve_provider_url("gemini", "", "http://unused"),
-            "https://generativelanguage.googleapis.com",
-        )
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(resolve_provider_url("ollama", ""), "http://127.0.0.1:11434")
+            self.assertEqual(resolve_provider_url("deepseek", ""), "https://api.deepseek.com")
+            self.assertEqual(resolve_provider_url("glm", ""), "https://open.bigmodel.cn/api/paas/v4")
+            self.assertEqual(resolve_provider_url("gemini", ""), "https://generativelanguage.googleapis.com")
 
     @patch.dict("os.environ", {"DEEPSEEK_API_KEY": "d", "GLM_API_KEY": "g", "GEMINI_API_KEY": "m"}, clear=False)
     def test_resolve_provider_api_key(self) -> None:
-        self.assertEqual(resolve_provider_api_key("deepseek", ""), "d")
-        self.assertEqual(resolve_provider_api_key("glm", ""), "g")
-        self.assertEqual(resolve_provider_api_key("gemini", ""), "m")
-        self.assertEqual(resolve_provider_api_key("ollama", ""), "")
+        self.assertEqual(resolve_provider_api_key("deepseek", "/tmp/missing"), "d")
+        self.assertEqual(resolve_provider_api_key("glm", "/tmp/missing"), "g")
+        self.assertEqual(resolve_provider_api_key("gemini", "/tmp/missing"), "m")
+        self.assertEqual(resolve_provider_api_key("ollama", "/tmp/missing"), "")
+
+    def test_vault_storage_and_lookup(self) -> None:
+        with TemporaryDirectory() as tmpdir:
+            vault_file = str(Path(tmpdir) / "vault.json")
+            save_vault(vault_file, {"providers": {"deepseek": {"api_key": "vault-token"}}})
+            self.assertEqual(load_vault(vault_file)["providers"]["deepseek"]["api_key"], "vault-token")
+            with patch.dict("os.environ", {}, clear=True):
+                self.assertEqual(resolve_provider_api_key("deepseek", vault_file), "vault-token")
+
+    @patch("getpass.getpass", return_value="abc123")
+    def test_configure_provider_saves_token(self, _mock_getpass) -> None:
+        with TemporaryDirectory() as tmpdir:
+            vault_file = str(Path(tmpdir) / "vault.json")
+            result = configure_provider("gemini", vault_file)
+            self.assertEqual(result, 0)
+            vault = load_vault(vault_file)
+            self.assertEqual(vault["providers"]["gemini"]["api_key"], "abc123")
+
+
+class ParserTests(unittest.TestCase):
+    def test_configure_subcommand_parsing(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["configure", "--provider", "deepseek"])
+        self.assertEqual(args.command, "configure")
+        self.assertEqual(args.provider, "deepseek")
+
+    def test_scan_subcommand_parsing(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["scan", "--url", "http://localhost:3000", "--model", "llama3.1"])
+        self.assertEqual(args.command, "scan")
+        self.assertEqual(args.provider, "ollama")
 
 
 if __name__ == "__main__":

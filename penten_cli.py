@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import asyncio
+import getpass
 import json
 import os
 import re
@@ -31,6 +32,13 @@ MAX_PAYLOADS_PER_PATH = 3
 OLLAMA_PATH_LIMIT = 30
 AI_TIMEOUT_SECONDS = 30
 SUPPORTED_PROVIDERS = ("ollama", "deepseek", "glm", "gemini")
+DEFAULT_PROVIDER_URLS = {
+    "ollama": "http://127.0.0.1:11434",
+    "deepseek": "https://api.deepseek.com",
+    "glm": "https://open.bigmodel.cn/api/paas/v4",
+    "gemini": "https://generativelanguage.googleapis.com",
+}
+DEFAULT_VAULT_FILE = str(Path.home() / ".penten" / "vault.json")
 DEFAULT_INJECTION_PAYLOADS = [
     "' OR '1'='1",
     "<script>alert(1)</script>",
@@ -234,32 +242,87 @@ def generate_ai_payloads(
         return []
 
 
-def resolve_provider_url(provider: str, provider_url: str, ollama_url: str) -> str:
+def resolve_provider_url(provider: str, provider_url: str) -> str:
     if provider_url:
         return provider_url
     provider_name = provider.lower().strip()
     if provider_name == "ollama":
-        return ollama_url
+        return os.getenv("OLLAMA_URL", os.getenv("OLLAMA_API_URL", DEFAULT_PROVIDER_URLS["ollama"]))
     if provider_name == "deepseek":
-        return os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com")
+        return os.getenv("DEEPSEEK_API_URL", DEFAULT_PROVIDER_URLS["deepseek"])
     if provider_name == "glm":
-        return os.getenv("GLM_API_URL", "https://open.bigmodel.cn/api/paas/v4")
+        return os.getenv("GLM_API_URL", DEFAULT_PROVIDER_URLS["glm"])
     if provider_name == "gemini":
-        return os.getenv("GEMINI_API_URL", "https://generativelanguage.googleapis.com")
+        return os.getenv("GEMINI_API_URL", DEFAULT_PROVIDER_URLS["gemini"])
     return provider_url
 
 
-def resolve_provider_api_key(provider: str, api_key: str) -> str:
-    if api_key:
-        return api_key
+def load_vault(vault_file: str) -> dict[str, Any]:
+    vault_path = Path(vault_file).expanduser()
+    if not vault_path.exists():
+        return {}
+    try:
+        content = json.loads(vault_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return content if isinstance(content, dict) else {}
+
+
+def save_vault(vault_file: str, content: dict[str, Any]) -> None:
+    vault_path = Path(vault_file).expanduser()
+    vault_path.parent.mkdir(parents=True, exist_ok=True)
+    vault_path.write_text(json.dumps(content, indent=2), encoding="utf-8")
+    try:
+        os.chmod(vault_path, 0o600)
+    except OSError:
+        pass
+
+
+def resolve_provider_api_key(provider: str, vault_file: str) -> str:
     provider_name = provider.lower().strip()
     if provider_name == "deepseek":
-        return os.getenv("DEEPSEEK_API_KEY", "")
+        return os.getenv("DEEPSEEK_API_KEY", _vault_api_key(provider_name, vault_file))
     if provider_name == "glm":
-        return os.getenv("GLM_API_KEY", os.getenv("ZAI_API_KEY", ""))
+        return os.getenv("GLM_API_KEY", os.getenv("ZAI_API_KEY", _vault_api_key(provider_name, vault_file)))
     if provider_name == "gemini":
-        return os.getenv("GEMINI_API_KEY", "")
+        return os.getenv("GEMINI_API_KEY", _vault_api_key(provider_name, vault_file))
     return ""
+
+
+def _vault_api_key(provider: str, vault_file: str) -> str:
+    vault = load_vault(vault_file)
+    providers = vault.get("providers")
+    if not isinstance(providers, dict):
+        return ""
+    provider_entry = providers.get(provider)
+    if not isinstance(provider_entry, dict):
+        return ""
+    api_key = provider_entry.get("api_key")
+    return str(api_key) if isinstance(api_key, str) else ""
+
+
+def configure_provider(provider: str, vault_file: str) -> int:
+    provider_name = provider.lower().strip()
+    if provider_name == "ollama":
+        print("Ollama does not require an API token. No token was stored.")
+        return 0
+    api_key = getpass.getpass(f"Enter API token for provider '{provider_name}': ").strip()
+    if not api_key:
+        print("Error: API token cannot be empty.")
+        return 2
+    vault = load_vault(vault_file)
+    providers = vault.get("providers")
+    if not isinstance(providers, dict):
+        providers = {}
+        vault["providers"] = providers
+    provider_entry = providers.get(provider_name)
+    if not isinstance(provider_entry, dict):
+        provider_entry = {}
+        providers[provider_name] = provider_entry
+    provider_entry["api_key"] = api_key
+    save_vault(vault_file, vault)
+    print(f"Saved token for provider '{provider_name}' in {Path(vault_file).expanduser()}.")
+    return 0
 
 
 def run_trufflehog_scan(scan_dir: Path) -> list[dict[str, Any]]:
@@ -517,8 +580,8 @@ async def run_scan(args: argparse.Namespace) -> int:
                 provider=args.provider,
                 model=args.model,
                 discovered_paths=sorted(discovered_paths),
-                provider_url=resolve_provider_url(args.provider, args.provider_url, args.ollama_url),
-                api_key=resolve_provider_api_key(args.provider, args.api_key),
+                provider_url=resolve_provider_url(args.provider, args.provider_url),
+                api_key=resolve_provider_api_key(args.provider, args.vault_file),
             )
         )
         payloads = deduplicate_strings(payloads)
@@ -626,52 +689,68 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Localhost-only Playwright crawler, profiler, injection tester and reporter."
     )
-    parser.add_argument("--url", required=True, help="Target URL, must resolve to localhost or 127.0.0.1.")
-    parser.add_argument(
+    subparsers = parser.add_subparsers(dest="command", required=True)
+
+    scan_parser = subparsers.add_parser("scan", help="Run a local scan.")
+    scan_parser.add_argument("--url", required=True, help="Target URL, must resolve to localhost or 127.0.0.1.")
+    scan_parser.add_argument(
         "--provider",
         default="ollama",
         choices=SUPPORTED_PROVIDERS,
         help="AI provider used for payload generation.",
     )
-    parser.add_argument("--model", required=True, help="Model name for the selected AI provider.")
-    parser.add_argument("--max-pages", type=int, default=50, help="Maximum number of pages to crawl.")
-    parser.add_argument("--max-forms", type=int, default=20, help="Maximum number of forms to exercise.")
-    parser.add_argument("--timeout", type=int, default=12, help="Per-page timeout in seconds.")
-    parser.add_argument(
-        "--ollama-url",
-        default=os.getenv("OLLAMA_URL", os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434")),
-        help="Base URL for local Ollama API (used when provider is ollama).",
-    )
-    parser.add_argument(
+    scan_parser.add_argument("--model", required=True, help="Model name for the selected AI provider.")
+    scan_parser.add_argument("--max-pages", type=int, default=50, help="Maximum number of pages to crawl.")
+    scan_parser.add_argument("--max-forms", type=int, default=20, help="Maximum number of forms to exercise.")
+    scan_parser.add_argument("--timeout", type=int, default=12, help="Per-page timeout in seconds.")
+    scan_parser.add_argument(
         "--provider-url",
         default="",
         help="Optional provider API base URL override.",
     )
-    parser.add_argument(
-        "--api-key",
-        default=os.getenv("AI_API_KEY", ""),
-        help="Optional provider API key override.",
+    scan_parser.add_argument(
+        "--vault-file",
+        default=os.getenv("PENTEN_VAULT_FILE", DEFAULT_VAULT_FILE),
+        help="Path to provider token vault file.",
     )
-    parser.add_argument(
+    scan_parser.add_argument(
         "--ignore-https-errors",
         action="store_true",
         help="Ignore HTTPS certificate errors during local scanning.",
     )
-    parser.add_argument(
+    scan_parser.add_argument(
         "--max-payloads-per-path",
         type=int,
         default=MAX_PAYLOADS_PER_PATH,
         help="Maximum number of injection payloads tested per discovered path.",
     )
-    parser.add_argument("--output-dir", default="", help="Directory for generated logs and reports.")
-    parser.add_argument("--show-browser", action="store_true", help="Show browser while scanning.")
+    scan_parser.add_argument("--output-dir", default="", help="Directory for generated logs and reports.")
+    scan_parser.add_argument("--show-browser", action="store_true", help="Show browser while scanning.")
+
+    configure_parser = subparsers.add_parser("configure", help="Store provider credentials in vault.")
+    configure_parser.add_argument(
+        "--provider",
+        required=True,
+        choices=SUPPORTED_PROVIDERS,
+        help="Provider to configure in vault.",
+    )
+    configure_parser.add_argument(
+        "--vault-file",
+        default=os.getenv("PENTEN_VAULT_FILE", DEFAULT_VAULT_FILE),
+        help="Path to provider token vault file.",
+    )
     return parser
 
 
-def main() -> int:
+def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    args = parser.parse_args()
+    parsed_argv = list(argv if argv is not None else sys.argv[1:])
+    if parsed_argv and parsed_argv[0] not in {"scan", "configure", "-h", "--help"}:
+        parsed_argv = ["scan", *parsed_argv]
+    args = parser.parse_args(parsed_argv)
     try:
+        if args.command == "configure":
+            return configure_provider(args.provider, args.vault_file)
         return asyncio.run(run_scan(args))
     except ValueError as error:
         parser.error(str(error))
