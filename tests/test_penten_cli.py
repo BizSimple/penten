@@ -1,9 +1,13 @@
 import unittest
+from unittest.mock import patch
 
 from penten_cli import (
     build_registration_value,
+    generate_ai_payloads,
     is_internal_url,
     path_from_url,
+    resolve_provider_api_key,
+    resolve_provider_url,
     validate_local_url,
 )
 
@@ -56,6 +60,86 @@ class FormValueTests(unittest.TestCase):
     def test_checkbox_and_fallback(self) -> None:
         self.assertEqual(build_registration_value("tos", "checkbox", 0, False, "X"), "on")
         self.assertEqual(build_registration_value("city", "text", 3, False, "X"), "value_3")
+
+
+class FakeHTTPResponse:
+    def __init__(self, body: str) -> None:
+        self._body = body
+
+    def read(self) -> bytes:
+        return self._body.encode("utf-8")
+
+    def __enter__(self) -> "FakeHTTPResponse":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        return None
+
+
+class ProviderPayloadTests(unittest.TestCase):
+    @patch("urllib.request.urlopen")
+    def test_ollama_payload_generation(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = FakeHTTPResponse('{"response":"[\\"x\\",\\"y\\"]"}')
+        payloads = generate_ai_payloads("ollama", "llama3", ["/login"], "http://localhost:11434", "")
+        self.assertEqual(payloads, ["x", "y"])
+
+    @patch("urllib.request.urlopen")
+    def test_deepseek_payload_generation(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = FakeHTTPResponse(
+            '{"choices":[{"message":{"content":"[\\"x\\",\\"y\\"]"}}]}'
+        )
+        payloads = generate_ai_payloads("deepseek", "deepseek-chat", ["/login"], "https://api.deepseek.com", "k")
+        self.assertEqual(payloads, ["x", "y"])
+
+    @patch("urllib.request.urlopen")
+    def test_glm_payload_generation(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = FakeHTTPResponse(
+            '{"choices":[{"message":{"content":"[\\"x\\",\\"y\\"]"}}]}'
+        )
+        payloads = generate_ai_payloads("glm", "glm-4.5", ["/login"], "https://open.bigmodel.cn/api/paas/v4", "k")
+        self.assertEqual(payloads, ["x", "y"])
+
+    @patch("urllib.request.urlopen")
+    def test_gemini_payload_generation(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = FakeHTTPResponse(
+            '{"candidates":[{"content":{"parts":[{"text":"[\\"x\\",\\"y\\"]"}]}}]}'
+        )
+        payloads = generate_ai_payloads(
+            "gemini",
+            "gemini-2.5-flash",
+            ["/login"],
+            "https://generativelanguage.googleapis.com",
+            "k",
+        )
+        self.assertEqual(payloads, ["x", "y"])
+
+    def test_missing_api_key_for_hosted_provider_returns_empty(self) -> None:
+        self.assertEqual(
+            generate_ai_payloads("deepseek", "deepseek-chat", ["/login"], "https://api.deepseek.com", ""),
+            [],
+        )
+
+    def test_resolve_provider_url(self) -> None:
+        self.assertEqual(
+            resolve_provider_url("ollama", "", "http://127.0.0.1:11434"),
+            "http://127.0.0.1:11434",
+        )
+        self.assertEqual(resolve_provider_url("deepseek", "", "http://unused"), "https://api.deepseek.com")
+        self.assertEqual(
+            resolve_provider_url("glm", "", "http://unused"),
+            "https://open.bigmodel.cn/api/paas/v4",
+        )
+        self.assertEqual(
+            resolve_provider_url("gemini", "", "http://unused"),
+            "https://generativelanguage.googleapis.com",
+        )
+
+    @patch.dict("os.environ", {"DEEPSEEK_API_KEY": "d", "GLM_API_KEY": "g", "GEMINI_API_KEY": "m"}, clear=False)
+    def test_resolve_provider_api_key(self) -> None:
+        self.assertEqual(resolve_provider_api_key("deepseek", ""), "d")
+        self.assertEqual(resolve_provider_api_key("glm", ""), "g")
+        self.assertEqual(resolve_provider_api_key("gemini", ""), "m")
+        self.assertEqual(resolve_provider_api_key("ollama", ""), "")
 
 
 if __name__ == "__main__":

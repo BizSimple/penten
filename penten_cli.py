@@ -29,7 +29,8 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1"}
 SENSITIVE_PATH_PATTERN = re.compile(r"/(admin|internal|private|debug)", flags=re.I)
 MAX_PAYLOADS_PER_PATH = 3
 OLLAMA_PATH_LIMIT = 30
-OLLAMA_TIMEOUT_SECONDS = 30
+AI_TIMEOUT_SECONDS = 30
+SUPPORTED_PROVIDERS = ("ollama", "deepseek", "glm", "gemini")
 DEFAULT_INJECTION_PAYLOADS = [
     "' OR '1'='1",
     "<script>alert(1)</script>",
@@ -128,37 +129,137 @@ def build_registration_value(field_name: str, field_type: str, index: int, injec
     return f"value_{index}"
 
 
-def generate_ai_payloads(model: str, discovered_paths: list[str], ollama_url: str) -> list[str]:
+def _extract_json_payloads(content: str) -> list[str]:
+    try:
+        parsed = json.loads(content)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(parsed, list):
+        return [str(item) for item in parsed if isinstance(item, str)]
+    if isinstance(parsed, dict):
+        for key in ("payloads", "data", "items"):
+            value = parsed.get(key)
+            if isinstance(value, list):
+                return [str(item) for item in value if isinstance(item, str)]
+    return []
+
+
+def _request_payload_generation(
+    url: str,
+    body: dict[str, Any],
+    headers: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    request = urllib.request.Request(
+        url,
+        data=json.dumps(body).encode("utf-8"),
+        headers={"Content-Type": "application/json", **(headers or {})},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=AI_TIMEOUT_SECONDS) as response:
+        return json.loads(response.read().decode("utf-8"))
+
+
+def generate_ai_payloads(
+    provider: str,
+    model: str,
+    discovered_paths: list[str],
+    provider_url: str,
+    api_key: str,
+) -> list[str]:
+    provider_name = provider.lower().strip()
     payload_prompt = (
         "Return 5 web security injection payloads as a JSON array of strings. "
         "Prioritize SQLi, XSS, SSTI and path traversal. Paths observed: "
         f"{', '.join(discovered_paths[:OLLAMA_PATH_LIMIT])}"
     )
-    request_data = json.dumps(
-        {"model": model, "prompt": payload_prompt, "stream": False, "format": "json"}
-    ).encode("utf-8")
-    request = urllib.request.Request(
-        ollama_url.rstrip("/") + "/api/generate",
-        data=request_data,
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
     try:
-        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
-            body = response.read().decode("utf-8")
+        if provider_name == "ollama":
+            response = _request_payload_generation(
+                provider_url.rstrip("/") + "/api/generate",
+                {"model": model, "prompt": payload_prompt, "stream": False, "format": "json"},
+            )
+            return _extract_json_payloads(str(response.get("response", "")))
+        if provider_name in {"deepseek", "glm"}:
+            if not api_key:
+                print(f"Warning: missing API key for {provider_name}. Using default payloads.")
+                return []
+            response = _request_payload_generation(
+                provider_url.rstrip("/") + "/chat/completions",
+                {
+                    "model": model,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": "Return only a JSON array of 5 web security injection payload strings.",
+                        },
+                        {"role": "user", "content": payload_prompt},
+                    ],
+                    "temperature": 0.2,
+                },
+                headers={"Authorization": "Bearer " + api_key},
+            )
+            choices = response.get("choices")
+            if isinstance(choices, list) and choices:
+                message = choices[0].get("message", {})
+                return _extract_json_payloads(str(message.get("content", "")))
+            return []
+        if provider_name == "gemini":
+            if not api_key:
+                print("Warning: missing API key for gemini. Using default payloads.")
+                return []
+            response = _request_payload_generation(
+                (
+                    provider_url.rstrip("/")
+                    + f"/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent"
+                    + f"?key={urllib.parse.quote(api_key)}"
+                ),
+                {
+                    "contents": [{"parts": [{"text": payload_prompt}]}],
+                    "generationConfig": {"responseMimeType": "application/json"},
+                },
+            )
+            candidates = response.get("candidates")
+            if isinstance(candidates, list) and candidates:
+                content = candidates[0].get("content", {})
+                parts = content.get("parts", [])
+                if isinstance(parts, list) and parts:
+                    return _extract_json_payloads(str(parts[0].get("text", "")))
+            return []
+        print(f"Warning: unsupported provider '{provider_name}'. Using default payloads.")
+        return []
     except (urllib.error.URLError, TimeoutError) as error:
-        print(f"Warning: failed to query Ollama for payloads ({error}). Using default payloads.")
+        print(f"Warning: failed to query {provider_name} for payloads ({error}). Using default payloads.")
         return []
-    try:
-        parsed = json.loads(body)
-        model_response = parsed.get("response", "")
-        if model_response:
-            extracted = json.loads(model_response)
-            if isinstance(extracted, list):
-                return [str(item) for item in extracted if isinstance(item, str)]
-    except (json.JSONDecodeError, TypeError, ValueError):
+    except (json.JSONDecodeError, TypeError, ValueError, KeyError):
         return []
-    return []
+
+
+def resolve_provider_url(provider: str, provider_url: str, ollama_url: str) -> str:
+    if provider_url:
+        return provider_url
+    provider_name = provider.lower().strip()
+    if provider_name == "ollama":
+        return ollama_url
+    if provider_name == "deepseek":
+        return os.getenv("DEEPSEEK_API_URL", "https://api.deepseek.com")
+    if provider_name == "glm":
+        return os.getenv("GLM_API_URL", "https://open.bigmodel.cn/api/paas/v4")
+    if provider_name == "gemini":
+        return os.getenv("GEMINI_API_URL", "https://generativelanguage.googleapis.com")
+    return provider_url
+
+
+def resolve_provider_api_key(provider: str, api_key: str) -> str:
+    if api_key:
+        return api_key
+    provider_name = provider.lower().strip()
+    if provider_name == "deepseek":
+        return os.getenv("DEEPSEEK_API_KEY", "")
+    if provider_name == "glm":
+        return os.getenv("GLM_API_KEY", os.getenv("ZAI_API_KEY", ""))
+    if provider_name == "gemini":
+        return os.getenv("GEMINI_API_KEY", "")
+    return ""
 
 
 def run_trufflehog_scan(scan_dir: Path) -> list[dict[str, Any]]:
@@ -411,7 +512,15 @@ async def run_scan(args: argparse.Namespace) -> int:
                     )
                 )
 
-        payloads.extend(generate_ai_payloads(args.model, sorted(discovered_paths), args.ollama_url))
+        payloads.extend(
+            generate_ai_payloads(
+                provider=args.provider,
+                model=args.model,
+                discovered_paths=sorted(discovered_paths),
+                provider_url=resolve_provider_url(args.provider, args.provider_url, args.ollama_url),
+                api_key=resolve_provider_api_key(args.provider, args.api_key),
+            )
+        )
         payloads = deduplicate_strings(payloads)
 
         for path in sorted(discovered_paths):
@@ -483,6 +592,7 @@ async def run_scan(args: argparse.Namespace) -> int:
     findings_serialized = [asdict(item) for item in findings]
     report = {
         "target": start_url,
+        "provider": args.provider,
         "model": args.model,
         "profile": {
             "crawl_seconds": crawl_seconds,
@@ -517,14 +627,30 @@ def build_parser() -> argparse.ArgumentParser:
         description="Localhost-only Playwright crawler, profiler, injection tester and reporter."
     )
     parser.add_argument("--url", required=True, help="Target URL, must resolve to localhost or 127.0.0.1.")
-    parser.add_argument("--model", required=True, help="Local Ollama model name.")
+    parser.add_argument(
+        "--provider",
+        default="ollama",
+        choices=SUPPORTED_PROVIDERS,
+        help="AI provider used for payload generation.",
+    )
+    parser.add_argument("--model", required=True, help="Model name for the selected AI provider.")
     parser.add_argument("--max-pages", type=int, default=50, help="Maximum number of pages to crawl.")
     parser.add_argument("--max-forms", type=int, default=20, help="Maximum number of forms to exercise.")
     parser.add_argument("--timeout", type=int, default=12, help="Per-page timeout in seconds.")
     parser.add_argument(
         "--ollama-url",
         default=os.getenv("OLLAMA_URL", os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434")),
-        help="Base URL for local Ollama API.",
+        help="Base URL for local Ollama API (used when provider is ollama).",
+    )
+    parser.add_argument(
+        "--provider-url",
+        default="",
+        help="Optional provider API base URL override.",
+    )
+    parser.add_argument(
+        "--api-key",
+        default=os.getenv("AI_API_KEY", ""),
+        help="Optional provider API key override.",
     )
     parser.add_argument(
         "--ignore-https-errors",

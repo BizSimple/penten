@@ -19,6 +19,7 @@ Local CI Pentesting
 ```bash
 python penten_cli.py \
   --url http://localhost:3000 \
+  --provider ollama \
   --model llama3.1 \
   --max-pages 50 \
   --max-payloads-per-path 3 \
@@ -30,5 +31,15 @@ python penten_cli.py \
 - Python 3.11+
 - `playwright` installed and browser runtime available
 - `trufflehog` available in PATH (optional but recommended)
-- Local Ollama API on `http://127.0.0.1:11434`
-  - Optional env vars: `OLLAMA_URL` (preferred) or `OLLAMA_API_URL`
+- AI payload provider:
+  - **Ollama** (`--provider ollama`): local API on `http://127.0.0.1:11434`
+    - Optional env vars: `OLLAMA_URL` (preferred) or `OLLAMA_API_URL`
+  - **DeepSeek** (`--provider deepseek`): model via `/chat/completions`
+    - API key via `--api-key` or `DEEPSEEK_API_KEY`
+    - Optional base URL override via `--provider-url` or `DEEPSEEK_API_URL`
+  - **GLM / z.ai** (`--provider glm`): model via `/chat/completions`
+    - API key via `--api-key` or `GLM_API_KEY` (or `ZAI_API_KEY`)
+    - Optional base URL override via `--provider-url` or `GLM_API_URL`
+  - **Gemini** (`--provider gemini`): model via `:generateContent`
+    - API key via `--api-key` or `GEMINI_API_KEY`
+    - Optional base URL override via `--provider-url` or `GEMINI_API_URL`
