@@ -397,6 +397,8 @@ async def fill_and_submit_form(
 
     for injected in (False, True):
         page = await context.new_page()
+        mode = "injected" if injected else "normal"
+        print(f"[form]  {mode} submission -> {origin_url} ({len(fields)} field(s))")
         try:
             await page.goto(origin_url, wait_until="domcontentloaded", timeout=10_000)
             payload = payloads[0] if payloads else DEFAULT_INJECTION_PAYLOADS[0]
@@ -440,6 +442,7 @@ async def fill_and_submit_form(
                         detail="Injected payload appears reflected in form response.",
                     )
                 )
+                print(f"  [!] MEDIUM reflected_input: payload reflected in form response on {origin_url}")
         except PlaywrightTimeoutError:
             findings.append(
                 Finding(
@@ -449,6 +452,7 @@ async def fill_and_submit_form(
                     detail="Timeout while filling or submitting form.",
                 )
             )
+            print(f"  [!] LOW form_timeout: {origin_url}")
         finally:
             await page.close()
 
@@ -464,6 +468,15 @@ async def run_scan(args: argparse.Namespace) -> int:
     pages_dir = output_dir / "pages"
     pages_dir.mkdir(exist_ok=True)
 
+    print("=" * 60)
+    print(f"[penten] target          : {start_url}")
+    print(f"[penten] output          : {output_dir}")
+    print(f"[penten] provider/model  : {args.provider} / {args.model}")
+    print(f"[penten] max-pages       : {args.max_pages}")
+    print(f"[penten] max-forms       : {args.max_forms}")
+    print(f"[penten] payloads/path   : {args.max_payloads_per_path}")
+    print("=" * 60)
+
     network_ops: list[NetworkOperation] = []
     findings: list[Finding] = []
     visited_urls: list[str] = []
@@ -475,6 +488,7 @@ async def run_scan(args: argparse.Namespace) -> int:
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not args.show_browser)
+        print(f"[browser] Chromium launched (headless={not args.show_browser})")
         context = await browser.new_context(ignore_https_errors=args.ignore_https_errors)
         page = await context.new_page()
 
@@ -516,6 +530,7 @@ async def run_scan(args: argparse.Namespace) -> int:
 
         queue: deque[str] = deque([start_url])
         seen: set[str] = set()
+        print(f"\n[crawl] Starting crawl from {start_url} (limit: {args.max_pages} pages) ...")
 
         while queue and len(visited_urls) < args.max_pages:
             current = queue.popleft()
@@ -529,6 +544,8 @@ async def run_scan(args: argparse.Namespace) -> int:
                 visited_urls.append(current)
                 discovered_paths.add(path_from_url(current))
                 status = response.status if response else None
+                status_str = str(status) if status is not None else "?"
+                print(f"[crawl] {len(visited_urls):>4}/{args.max_pages}  {status_str}  {current}")
                 if status and status >= 500:
                     findings.append(
                         Finding(
@@ -538,6 +555,7 @@ async def run_scan(args: argparse.Namespace) -> int:
                             detail=f"Navigation received HTTP {status}",
                         )
                     )
+                    print(f"  [!] HIGH server_error: HTTP {status} on {current}")
                 if "/api" in path_from_url(current).lower() and status in {200, 201, 202}:
                     findings.append(
                         Finding(
@@ -547,6 +565,7 @@ async def run_scan(args: argparse.Namespace) -> int:
                             detail="API-like endpoint was accessible without obvious authentication.",
                         )
                     )
+                    print(f"  [!] MEDIUM private_api_possible_exposure: {current}")
                 if SENSITIVE_PATH_PATTERN.search(path_from_url(current)) and status in {
                     200,
                     201,
@@ -560,6 +579,7 @@ async def run_scan(args: argparse.Namespace) -> int:
                             detail="Sensitive-looking path was reachable.",
                         )
                     )
+                    print(f"  [!] MEDIUM sensitive_path_exposed: {current}")
 
                 html = await page.content()
                 page_file = pages_dir / f"page-{len(visited_urls):04d}.html"
@@ -575,6 +595,13 @@ async def run_scan(args: argparse.Namespace) -> int:
                             queue.append(normalized)
                 for form in parser.forms:
                     discovered_forms.append((current, form))
+                new_links = sum(
+                    1
+                    for d in parser.links
+                    if is_internal_url(start_host, urllib.parse.urldefrag(urllib.parse.urljoin(current, d))[0])
+                )
+                if parser.links or parser.forms:
+                    print(f"       -> {new_links} link(s), {len(parser.forms)} form(s) discovered")
             except Exception as error:
                 findings.append(
                     Finding(
@@ -584,7 +611,12 @@ async def run_scan(args: argparse.Namespace) -> int:
                         detail=str(error),
                     )
                 )
+                print(f"  [!] LOW crawl_error: {current} — {error}")
 
+        print(
+            f"\n[payloads] Requesting AI payloads from {args.provider} (model: {args.model}) "
+            f"using {len(discovered_paths)} discovered path(s) as context ..."
+        )
         payloads.extend(
             generate_ai_payloads(
                 provider=args.provider,
@@ -595,11 +627,16 @@ async def run_scan(args: argparse.Namespace) -> int:
             )
         )
         payloads = deduplicate_strings(payloads)
+        print(f"[payloads] {len(payloads)} payload(s) ready (default + AI-generated)")
 
+        print(
+            f"\n[inject] Testing {len(discovered_paths)} path(s) with up to {args.max_payloads_per_path} payload(s) each ..."
+        )
         for path in sorted(discovered_paths):
             base = urllib.parse.urljoin(start_url, path)
             for payload in payloads[: args.max_payloads_per_path]:
                 attack_url = f"{base}?penten_probe={urllib.parse.quote(payload)}"
+                print(f"[inject] {path}  <-  {payload[:50]!r}")
                 try:
                     response = await page.goto(attack_url, wait_until="domcontentloaded", timeout=args.timeout * 1000)
                     status = response.status if response else None
@@ -612,6 +649,7 @@ async def run_scan(args: argparse.Namespace) -> int:
                                 detail=f"Injection payload triggered HTTP {status}",
                             )
                         )
+                        print(f"  [!] HIGH injection_triggered_error: HTTP {status}")
                     body = await page.content()
                     if payload in body:
                         findings.append(
@@ -622,6 +660,7 @@ async def run_scan(args: argparse.Namespace) -> int:
                                 detail="Payload reflected in response body.",
                             )
                         )
+                        print(f"  [!] MEDIUM reflected_input: payload reflected on {path}")
                 except Exception as error:
                     findings.append(
                         Finding(
@@ -631,7 +670,10 @@ async def run_scan(args: argparse.Namespace) -> int:
                             detail=str(error),
                         )
                     )
+                    print(f"  [!] LOW injection_test_error: {error}")
 
+        form_count = min(len(discovered_forms), args.max_forms)
+        print(f"\n[forms] Submitting {form_count} form(s) ...")
         for form_url, form in discovered_forms[: args.max_forms]:
             await fill_and_submit_form(context, form_url, form, payloads, findings)
 
@@ -640,6 +682,7 @@ async def run_scan(args: argparse.Namespace) -> int:
 
     crawl_seconds = time.perf_counter() - crawl_start
 
+    print(f"\n[secrets] Running trufflehog scan on {output_dir} ...")
     trufflehog_results = run_trufflehog_scan(output_dir)
     if trufflehog_results and "error" not in trufflehog_results[0]:
         findings.append(
@@ -689,9 +732,23 @@ async def run_scan(args: argparse.Namespace) -> int:
     (output_dir / "network.json").write_text(json.dumps(network_serialized, indent=2), encoding="utf-8")
     (output_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
 
-    print(f"Scan complete. Report: {output_dir / 'report.json'}")
-    print(json.dumps(report["profile"], indent=2))
-    print(f"Findings: {len(findings_serialized)}")
+    print("\n" + "=" * 60)
+    print(f"[done] Scan complete in {crawl_seconds:.1f}s")
+    print(f"[done] Visited {len(visited_urls)} URL(s) across {len(discovered_paths)} path(s)")
+    print(f"[done] Network events logged: {len(network_serialized)}")
+    print(f"[done] Findings: {len(findings_serialized)}")
+    if findings_serialized:
+        by_severity: dict[str, int] = {}
+        for f in findings_serialized:
+            by_severity[f["severity"]] = by_severity.get(f["severity"], 0) + 1
+        for severity in ("high", "medium", "low"):
+            count = by_severity.get(severity, 0)
+            if count:
+                print(f"         {severity}: {count}")
+    print(f"[done] Report : {output_dir / 'report.json'}")
+    print(f"[done] Network: {output_dir / 'network.json'}")
+    print(f"[done] Pages  : {pages_dir}")
+    print("=" * 60)
     return 0
 
 
