@@ -72,8 +72,8 @@ class FakeHTTPResponse:
     def __enter__(self) -> "FakeHTTPResponse":
         return self
 
-    def __exit__(self, exc_type, exc, traceback) -> None:
-        return None
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        return False
 
 
 class ProviderPayloadTests(unittest.TestCase):
