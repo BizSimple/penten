@@ -28,6 +28,8 @@ except ImportError:  # pragma: no cover - exercised only without playwright inst
 LOCAL_HOSTS = {"localhost", "127.0.0.1"}
 SENSITIVE_PATH_PATTERN = re.compile(r"/(admin|internal|private|debug)", flags=re.I)
 MAX_PAYLOADS_PER_PATH = 3
+OLLAMA_PATH_LIMIT = 30
+OLLAMA_TIMEOUT_SECONDS = 30
 DEFAULT_INJECTION_PAYLOADS = [
     "' OR '1'='1",
     "<script>alert(1)</script>",
@@ -129,7 +131,7 @@ def generate_ai_payloads(model: str, discovered_paths: list[str], ollama_url: st
     payload_prompt = (
         "Return 5 web security injection payloads as a JSON array of strings. "
         "Prioritize SQLi, XSS, SSTI and path traversal. Paths observed: "
-        f"{', '.join(discovered_paths[:30])}"
+        f"{', '.join(discovered_paths[:OLLAMA_PATH_LIMIT])}"
     )
     request_data = json.dumps(
         {"model": model, "prompt": payload_prompt, "stream": False, "format": "json"}
@@ -141,7 +143,7 @@ def generate_ai_payloads(model: str, discovered_paths: list[str], ollama_url: st
         method="POST",
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
             body = response.read().decode("utf-8")
     except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
         print(f"Warning: failed to query Ollama for payloads ({error}). Using default payloads.")
@@ -413,7 +415,7 @@ async def run_scan(args: argparse.Namespace) -> int:
 
         for path in sorted(discovered_paths):
             base = urllib.parse.urljoin(start_url, path)
-            for payload in payloads[:MAX_PAYLOADS_PER_PATH]:
+            for payload in payloads[: args.max_payloads_per_path]:
                 attack_url = f"{base}?penten_probe={urllib.parse.quote(payload)}"
                 try:
                     response = await page.goto(attack_url, wait_until="domcontentloaded", timeout=args.timeout * 1000)
@@ -520,13 +522,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=int, default=12, help="Per-page timeout in seconds.")
     parser.add_argument(
         "--ollama-url",
-        default=os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434"),
+        default=os.getenv("OLLAMA_URL", os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434")),
         help="Base URL for local Ollama API.",
     )
     parser.add_argument(
         "--ignore-https-errors",
         action="store_true",
         help="Ignore HTTPS certificate errors during local scanning.",
+    )
+    parser.add_argument(
+        "--max-payloads-per-path",
+        type=int,
+        default=MAX_PAYLOADS_PER_PATH,
+        help="Maximum number of injection payloads tested per discovered path.",
     )
     parser.add_argument("--output-dir", default="", help="Directory for generated logs and reports.")
     parser.add_argument("--show-browser", action="store_true", help="Show browser while scanning.")

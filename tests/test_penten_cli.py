@@ -19,12 +19,21 @@ class ValidateLocalURLTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             validate_local_url("http://example.com")
 
+    def test_rejects_invalid_scheme(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_local_url("ftp://localhost")
+
+    def test_removes_fragment(self) -> None:
+        self.assertEqual(validate_local_url("http://localhost/app#frag"), "http://localhost/app")
+
 
 class URLHelpersTests(unittest.TestCase):
     def test_is_internal_url(self) -> None:
         self.assertTrue(is_internal_url("localhost", "/relative/path"))
         self.assertTrue(is_internal_url("localhost", "http://localhost/a"))
         self.assertTrue(is_internal_url("localhost", "http://127.0.0.1/a"))
+        self.assertTrue(is_internal_url("127.0.0.1", "http://localhost:3000/a"))
+        self.assertTrue(is_internal_url("LOCALHOST", "http://localhost/a"))
         self.assertFalse(is_internal_url("localhost", "http://example.com/a"))
 
     def test_path_from_url(self) -> None:
@@ -40,6 +49,13 @@ class FormValueTests(unittest.TestCase):
 
     def test_injected_prefers_payload_for_text(self) -> None:
         self.assertEqual(build_registration_value("name", "text", 0, True, "PAYLOAD"), "PAYLOAD")
+
+    def test_injected_does_not_override_hidden(self) -> None:
+        self.assertEqual(build_registration_value("token", "hidden", 2, True, "PAYLOAD"), "value_2")
+
+    def test_checkbox_and_fallback(self) -> None:
+        self.assertEqual(build_registration_value("tos", "checkbox", 0, False, "X"), "on")
+        self.assertEqual(build_registration_value("city", "text", 3, False, "X"), "value_3")
 
 
 if __name__ == "__main__":

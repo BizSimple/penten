@@ -21,6 +21,7 @@ python penten_cli.py \
   --url http://localhost:3000 \
   --model llama3.1 \
   --max-pages 50 \
+  --max-payloads-per-path 3 \
   --ollama-url http://127.0.0.1:11434 \
   --output-dir ./scan-results
 ```
@@ -30,3 +31,4 @@ python penten_cli.py \
 - `playwright` installed and browser runtime available
 - `trufflehog` available in PATH (optional but recommended)
 - Local Ollama API on `http://127.0.0.1:11434`
+  - Optional env vars: `OLLAMA_URL` (preferred) or `OLLAMA_API_URL`
