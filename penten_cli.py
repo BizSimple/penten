@@ -29,9 +29,10 @@ except ImportError:  # pragma: no cover - exercised only without playwright inst
 LOCAL_HOSTS = {"localhost", "127.0.0.1"}
 SENSITIVE_PATH_PATTERN = re.compile(r"/(admin|internal|private|debug)", flags=re.I)
 MAX_PAYLOADS_PER_PATH = 3
-OLLAMA_PATH_LIMIT = 30
+AI_PATH_CONTEXT_LIMIT = 30
 AI_TIMEOUT_SECONDS = 30
 SUPPORTED_PROVIDERS = ("ollama", "deepseek", "glm", "gemini")
+SUPPORTED_COMMANDS = ("scan", "configure")
 DEFAULT_PROVIDER_URLS = {
     "ollama": "http://127.0.0.1:11434",
     "deepseek": "https://api.deepseek.com",
@@ -39,6 +40,9 @@ DEFAULT_PROVIDER_URLS = {
     "gemini": "https://generativelanguage.googleapis.com",
 }
 DEFAULT_VAULT_FILE = str(Path.home() / ".penten" / "vault.json")
+EXIT_SUCCESS = 0
+EXIT_INVALID_INPUT = 2
+EXIT_INTERRUPTED = 130
 DEFAULT_INJECTION_PAYLOADS = [
     "' OR '1'='1",
     "<script>alert(1)</script>",
@@ -178,7 +182,7 @@ def generate_ai_payloads(
     payload_prompt = (
         "Return 5 web security injection payloads as a JSON array of strings. "
         "Prioritize SQLi, XSS, SSTI and path traversal. Paths observed: "
-        f"{', '.join(discovered_paths[:OLLAMA_PATH_LIMIT])}"
+        f"{', '.join(discovered_paths[:AI_PATH_CONTEXT_LIMIT])}"
     )
     try:
         if provider_name == "ollama":
@@ -254,7 +258,7 @@ def resolve_provider_url(provider: str, provider_url: str) -> str:
         return os.getenv("GLM_API_URL", DEFAULT_PROVIDER_URLS["glm"])
     if provider_name == "gemini":
         return os.getenv("GEMINI_API_URL", DEFAULT_PROVIDER_URLS["gemini"])
-    return provider_url
+    return DEFAULT_PROVIDER_URLS["ollama"]
 
 
 def load_vault(vault_file: str) -> dict[str, Any]:
@@ -283,7 +287,13 @@ def resolve_provider_api_key(provider: str, vault_file: str) -> str:
     if provider_name == "deepseek":
         return os.getenv("DEEPSEEK_API_KEY", _vault_api_key(provider_name, vault_file))
     if provider_name == "glm":
-        return os.getenv("GLM_API_KEY", os.getenv("ZAI_API_KEY", _vault_api_key(provider_name, vault_file)))
+        glm_api_key = os.getenv("GLM_API_KEY")
+        if glm_api_key:
+            return glm_api_key
+        zai_api_key = os.getenv("ZAI_API_KEY")
+        if zai_api_key:
+            return zai_api_key
+        return _vault_api_key(provider_name, vault_file)
     if provider_name == "gemini":
         return os.getenv("GEMINI_API_KEY", _vault_api_key(provider_name, vault_file))
     return ""
@@ -304,12 +314,12 @@ def _vault_api_key(provider: str, vault_file: str) -> str:
 def configure_provider(provider: str, vault_file: str) -> int:
     provider_name = provider.lower().strip()
     if provider_name == "ollama":
-        print("Ollama does not require an API token. No token was stored.")
-        return 0
-    api_key = getpass.getpass(f"Enter API token for provider '{provider_name}': ").strip()
-    if not api_key:
+        print("Ollama configuration does not require a token.")
+        return EXIT_SUCCESS
+    raw_api_key = getpass.getpass(f"Enter API token for provider '{provider_name}': ")
+    if not raw_api_key.strip():
         print("Error: API token cannot be empty.")
-        return 2
+        return EXIT_INVALID_INPUT
     vault = load_vault(vault_file)
     providers = vault.get("providers")
     if not isinstance(providers, dict):
@@ -319,10 +329,10 @@ def configure_provider(provider: str, vault_file: str) -> int:
     if not isinstance(provider_entry, dict):
         provider_entry = {}
         providers[provider_name] = provider_entry
-    provider_entry["api_key"] = api_key
+    provider_entry["api_key"] = raw_api_key
     save_vault(vault_file, vault)
     print(f"Saved token for provider '{provider_name}' in {Path(vault_file).expanduser()}.")
-    return 0
+    return EXIT_SUCCESS
 
 
 def run_trufflehog_scan(scan_dir: Path) -> list[dict[str, Any]]:
@@ -744,8 +754,9 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
-    parsed_argv = list(argv if argv is not None else sys.argv[1:])
-    if parsed_argv and parsed_argv[0] not in {"scan", "configure", "-h", "--help"}:
+    parsed_argv = argv if argv is not None else sys.argv[1:]
+    if parsed_argv and parsed_argv[0] not in {*SUPPORTED_COMMANDS, "-h", "--help"}:
+        print("Warning: defaulting to 'scan' command. Use `scan` explicitly.")
         parsed_argv = ["scan", *parsed_argv]
     args = parser.parse_args(parsed_argv)
     try:
@@ -756,7 +767,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(error))
     except KeyboardInterrupt:
         print("Interrupted.")
-        return 130
+        return EXIT_INTERRUPTED
 
 
 if __name__ == "__main__":

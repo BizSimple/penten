@@ -53,6 +53,7 @@ class URLHelpersTests(unittest.TestCase):
 
 class FormValueTests(unittest.TestCase):
     def test_registration_values(self) -> None:
+        self.assertEqual(build_registration_value("email", "email", 0, False, "X"), "penten0@example.com")
         self.assertEqual(build_registration_value("email", "email", 1, False, "X"), "penten1@example.com")
         self.assertEqual(build_registration_value("password", "password", 0, False, "X"), "StrongPass123!")
         self.assertEqual(build_registration_value("username", "text", 0, False, "X"), "penten_user_0")
@@ -125,6 +126,12 @@ class ProviderPayloadTests(unittest.TestCase):
             [],
         )
 
+    @patch("urllib.request.urlopen")
+    def test_invalid_provider_response_returns_empty(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = FakeHTTPResponse('{"choices":[{"message":{"content":"not-json"}}]}')
+        payloads = generate_ai_payloads("deepseek", "deepseek-chat", ["/login"], "https://api.deepseek.com", "k")
+        self.assertEqual(payloads, [])
+
     def test_resolve_provider_url(self) -> None:
         with patch.dict("os.environ", {}, clear=True):
             self.assertEqual(resolve_provider_url("ollama", ""), "http://127.0.0.1:11434")
@@ -132,7 +139,7 @@ class ProviderPayloadTests(unittest.TestCase):
             self.assertEqual(resolve_provider_url("glm", ""), "https://open.bigmodel.cn/api/paas/v4")
             self.assertEqual(resolve_provider_url("gemini", ""), "https://generativelanguage.googleapis.com")
 
-    @patch.dict("os.environ", {"DEEPSEEK_API_KEY": "d", "GLM_API_KEY": "g", "GEMINI_API_KEY": "m"}, clear=False)
+    @patch.dict("os.environ", {"DEEPSEEK_API_KEY": "d", "GLM_API_KEY": "g", "GEMINI_API_KEY": "m"}, clear=True)
     def test_resolve_provider_api_key(self) -> None:
         self.assertEqual(resolve_provider_api_key("deepseek", "/tmp/missing"), "d")
         self.assertEqual(resolve_provider_api_key("glm", "/tmp/missing"), "g")
