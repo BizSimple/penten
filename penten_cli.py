@@ -32,7 +32,27 @@ MAX_PAYLOADS_PER_PATH = 3
 AI_PATH_CONTEXT_LIMIT = 30
 AI_TIMEOUT_SECONDS = 30
 SUPPORTED_PROVIDERS = ("ollama", "deepseek", "glm", "gemini")
-SUPPORTED_COMMANDS = ("scan", "configure")
+SUPPORTED_COMMANDS = ("scan", "configure", "navigate")
+AI_NAVIGATE_MAX_STEPS = 20
+AI_NAVIGATE_CONSOLE_LIMIT = 20
+AI_NAVIGATE_NETWORK_LIMIT = 20
+AI_NAVIGATE_SUMMARY_LINKS = 30
+AI_NAVIGATE_SYSTEM_PROMPT = (
+    "You are an autonomous web security tester driving a browser. "
+    "At each step you receive the current page state (URL, structural summary, "
+    "console logs, recent network activity) and must respond with exactly one "
+    "JSON action object — no markdown fences, no extra text. "
+    "Available actions:\n"
+    '  {"action":"navigate","url":"<url>"}\n'
+    '  {"action":"click","selector":"<css-selector>"}\n'
+    '  {"action":"click_text","text":"<visible-button-or-link-text>"}\n'
+    '  {"action":"fill","selector":"<css-selector>","value":"<value>"}\n'
+    '  {"action":"report_finding","category":"<slug>","severity":"high|medium|low","detail":"<description>"}\n'
+    '  {"action":"done","summary":"<exploration-summary>"}\n'
+    "Focus on: discovering hidden/sensitive paths, unprotected admin panels, "
+    "authentication bypass, reflected/stored injection vulnerabilities, and "
+    "exposed private data. Stay within the local target host only."
+)
 DEFAULT_PROVIDER_URLS = {
     "ollama": "http://127.0.0.1:11434",
     "deepseek": "https://api.deepseek.com",
@@ -244,6 +264,146 @@ def generate_ai_payloads(
         return []
     except (json.JSONDecodeError, TypeError, ValueError, KeyError):
         return []
+
+
+def summarize_page_for_ai(
+    url: str,
+    html: str,
+    console_logs: list[str],
+    network_ops: list[NetworkOperation],
+) -> str:
+    """Return a concise structural summary of a page suitable for AI context."""
+    parser = LinkAndFormParser()
+    parser.feed(html)
+
+    title_match = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+    title = re.sub(r"<[^>]+>", "", title_match.group(1)).strip() if title_match else "(no title)"
+
+    heading_tags = re.findall(r"<h[1-3][^>]*>(.*?)</h[1-3]>", html, re.I | re.S)
+    headings = [re.sub(r"<[^>]+>", "", h).strip() for h in heading_tags[:8] if h.strip()]
+
+    lines: list[str] = [f"URL: {url}", f"Title: {title}"]
+    if headings:
+        lines.append("Headings: " + " | ".join(headings))
+    if parser.links:
+        shown = parser.links[:AI_NAVIGATE_SUMMARY_LINKS]
+        lines.append(
+            f"Links ({len(parser.links)} total, showing {len(shown)}): "
+            + ", ".join(shown)
+        )
+    for i, form in enumerate(parser.forms, start=1):
+        field_names = [f["name"] for f in form.get("fields", [])]
+        lines.append(
+            f"Form {i}: {form['method'].upper()} {form['action'] or '(current)'}"
+            f" fields=[{', '.join(field_names)}]"
+        )
+    if console_logs:
+        recent = console_logs[-AI_NAVIGATE_CONSOLE_LIMIT:]
+        lines.append("Console: " + "; ".join(recent))
+    if network_ops:
+        recent_net = network_ops[-AI_NAVIGATE_NETWORK_LIMIT:]
+        net_lines = [
+            f"{op.method} {op.url} -> {op.status or '?'}" for op in recent_net
+        ]
+        lines.append("Network: " + "; ".join(net_lines))
+    return "\n".join(lines)
+
+
+def _parse_navigation_action(text: str) -> dict[str, Any] | None:
+    """Extract the first JSON action object from AI response text."""
+    text = text.strip()
+    try:
+        obj = json.loads(text)
+        if isinstance(obj, dict) and "action" in obj:
+            return obj
+    except json.JSONDecodeError:
+        pass
+    match = re.search(r"\{[^{}]*\"action\"[^{}]*\}", text, re.S)
+    if match:
+        try:
+            obj = json.loads(match.group())
+            if isinstance(obj, dict) and "action" in obj:
+                return obj
+        except json.JSONDecodeError:
+            pass
+    return None
+
+
+def request_ai_navigation_action(
+    provider: str,
+    model: str,
+    provider_url: str,
+    api_key: str,
+    messages: list[dict[str, Any]],
+) -> str | None:
+    """Send a multi-turn conversation to the AI provider and return the response text."""
+    provider_name = provider.lower().strip()
+    try:
+        if provider_name == "ollama":
+            response = _request_payload_generation(
+                provider_url.rstrip("/") + "/api/chat",
+                {"model": model, "messages": messages, "stream": False},
+            )
+            msg = response.get("message")
+            if isinstance(msg, dict):
+                return str(msg.get("content", ""))
+            # Older Ollama versions may expose response at top level
+            return str(response.get("response", ""))
+
+        if provider_name in {"deepseek", "glm"}:
+            if not api_key:
+                print(f"Warning: missing API key for {provider_name}. Cannot navigate.")
+                return None
+            response = _request_payload_generation(
+                provider_url.rstrip("/") + "/chat/completions",
+                {"model": model, "messages": messages, "temperature": 0.3},
+                headers={"Authorization": "Bearer " + api_key},
+            )
+            choices = response.get("choices")
+            if isinstance(choices, list) and choices:
+                return str(choices[0].get("message", {}).get("content", ""))
+            return None
+
+        if provider_name == "gemini":
+            if not api_key:
+                print("Warning: missing API key for gemini. Cannot navigate.")
+                return None
+            system_content = next(
+                (m["content"] for m in messages if m.get("role") == "system"), ""
+            )
+            gemini_contents = [
+                {
+                    "role": "user" if m["role"] == "user" else "model",
+                    "parts": [{"text": m["content"]}],
+                }
+                for m in messages
+                if m.get("role") != "system"
+            ]
+            body: dict[str, Any] = {"contents": gemini_contents}
+            if system_content:
+                body["systemInstruction"] = {"parts": [{"text": system_content}]}
+            response = _request_payload_generation(
+                (
+                    provider_url.rstrip("/")
+                    + f"/v1beta/models/{urllib.parse.quote(model, safe='')}:generateContent"
+                    + f"?key={urllib.parse.quote(api_key)}"
+                ),
+                body,
+            )
+            candidates = response.get("candidates")
+            if isinstance(candidates, list) and candidates:
+                parts = candidates[0].get("content", {}).get("parts", [])
+                if isinstance(parts, list) and parts:
+                    return str(parts[0].get("text", ""))
+            return None
+
+        print(f"Warning: unsupported provider '{provider_name}'. Cannot navigate.")
+        return None
+    except (urllib.error.URLError, TimeoutError) as error:
+        print(f"Warning: AI navigation request failed ({error}).")
+        return None
+    except (json.JSONDecodeError, TypeError, ValueError, KeyError):
+        return None
 
 
 def resolve_provider_url(provider: str, provider_url: str) -> str:
@@ -459,6 +619,293 @@ async def fill_and_submit_form(
             print(f"  [!] LOW form_timeout: {origin_url}")
         finally:
             await page.close()
+
+
+async def execute_navigation_action(
+    page: Any,
+    action: dict[str, Any],
+    start_host: str,
+    findings: list[Finding],
+) -> tuple[bool, str]:
+    """Execute one AI-chosen navigation action via Playwright.
+
+    Returns ``(is_done, result_message)`` where *is_done* signals the AI has
+    finished its exploration.
+    """
+    action_name = action.get("action", "")
+
+    if action_name == "done":
+        summary = action.get("summary", "Exploration complete.")
+        return True, f"[ai-nav] done: {summary}"
+
+    if action_name == "navigate":
+        url = str(action.get("url", ""))
+        if not url:
+            return False, "[ai-nav] navigate: missing url"
+        parsed = urllib.parse.urlparse(url)
+        if parsed.hostname and parsed.hostname.lower() not in LOCAL_HOSTS:
+            return False, f"[ai-nav] navigate: blocked non-local URL {url}"
+        try:
+            response = await page.goto(url, wait_until="domcontentloaded", timeout=10_000)
+            status = response.status if response else "?"
+            return False, f"[ai-nav] navigate -> {url} (HTTP {status})"
+        except PlaywrightTimeoutError:
+            return False, f"[ai-nav] navigate timeout: {url}"
+        except Exception as exc:
+            return False, f"[ai-nav] navigate error: {exc}"
+
+    if action_name == "click":
+        selector = str(action.get("selector", ""))
+        if not selector:
+            return False, "[ai-nav] click: missing selector"
+        try:
+            await page.locator(selector).first.click(timeout=5_000)
+            await page.wait_for_timeout(500)
+            return False, f"[ai-nav] click: {selector}"
+        except Exception as exc:
+            return False, f"[ai-nav] click error ({selector}): {exc}"
+
+    if action_name == "click_text":
+        text = str(action.get("text", ""))
+        if not text:
+            return False, "[ai-nav] click_text: missing text"
+        try:
+            await page.get_by_text(text, exact=False).first.click(timeout=5_000)
+            await page.wait_for_timeout(500)
+            return False, f"[ai-nav] click_text: {text!r}"
+        except Exception as exc:
+            return False, f"[ai-nav] click_text error ({text!r}): {exc}"
+
+    if action_name == "fill":
+        selector = str(action.get("selector", ""))
+        value = str(action.get("value", ""))
+        if not selector:
+            return False, "[ai-nav] fill: missing selector"
+        try:
+            await page.locator(selector).first.fill(value, timeout=5_000)
+            return False, f"[ai-nav] fill {selector} = {value!r}"
+        except Exception as exc:
+            return False, f"[ai-nav] fill error ({selector}): {exc}"
+
+    if action_name == "report_finding":
+        category = str(action.get("category", "ai_finding"))
+        severity = str(action.get("severity", "low"))
+        detail = str(action.get("detail", ""))
+        if not category.startswith("ai_"):
+            category = f"ai_{category}"
+        if severity not in {"high", "medium", "low"}:
+            severity = "low"
+        findings.append(
+            Finding(
+                category=category,
+                severity=severity,
+                url=page.url,
+                detail=detail,
+            )
+        )
+        return False, f"[ai-nav] finding [{severity}] {category}: {detail}"
+
+    return False, f"[ai-nav] unknown action: {action_name!r}"
+
+
+async def run_ai_navigation_loop(
+    page: Any,
+    start_url: str,
+    args: argparse.Namespace,
+    findings: list[Finding],
+    network_ops: list[NetworkOperation],
+) -> list[str]:
+    """Agentic loop: capture page state → ask AI → execute action → repeat.
+
+    Returns the list of action-result strings representing what was done.
+    """
+    provider_url = resolve_provider_url(args.provider, args.provider_url)
+    api_key = resolve_provider_api_key(args.provider, args.vault_file)
+    start_host = urllib.parse.urlparse(start_url).hostname or ""
+
+    console_logs: list[str] = []
+    page.on("console", lambda msg: console_logs.append(f"[{msg.type}] {msg.text}"))
+
+    messages: list[dict[str, Any]] = [
+        {"role": "system", "content": AI_NAVIGATE_SYSTEM_PROMPT}
+    ]
+    action_history: list[str] = []
+
+    print(
+        f"\n[ai-nav] Starting AI-driven navigation "
+        f"(provider={args.provider}, model={args.model}, max-steps={args.max_steps}) ..."
+    )
+
+    try:
+        await page.goto(start_url, wait_until="domcontentloaded", timeout=args.timeout * 1000)
+    except Exception as exc:
+        print(f"[ai-nav] Failed to load start URL: {exc}")
+        return action_history
+
+    for step in range(args.max_steps):
+        html = await page.content()
+        current_url = page.url
+        page_summary = summarize_page_for_ai(
+            current_url, html, list(console_logs), list(network_ops)
+        )
+
+        recent_history = action_history[-5:]
+        history_note = (
+            ("\nRecent actions:\n" + "\n".join(f"  - {a}" for a in recent_history) + "\n")
+            if recent_history
+            else ""
+        )
+        user_content = (
+            f"Step {step + 1}/{args.max_steps}{history_note}\n"
+            f"Current page:\n{page_summary}"
+        )
+        messages.append({"role": "user", "content": user_content})
+
+        print(f"\n[ai-nav] Step {step + 1}/{args.max_steps}  url={current_url}")
+
+        raw_response = request_ai_navigation_action(
+            provider=args.provider,
+            model=args.model,
+            provider_url=provider_url,
+            api_key=api_key,
+            messages=messages,
+        )
+
+        if raw_response is None:
+            print("[ai-nav] No response from AI. Stopping.")
+            break
+
+        print(f"[ai-nav] AI → {raw_response[:200]!r}")
+        messages.append({"role": "assistant", "content": raw_response})
+
+        action = _parse_navigation_action(raw_response)
+        if action is None:
+            print(f"[ai-nav] Could not parse action from: {raw_response[:100]!r}")
+            messages.append(
+                {
+                    "role": "user",
+                    "content": (
+                        "ERROR: Could not parse your response as a JSON action. "
+                        "Respond with a single JSON object only, no markdown."
+                    ),
+                }
+            )
+            continue
+
+        is_done, result = await execute_navigation_action(
+            page, action, start_host, findings
+        )
+        print(result)
+        action_history.append(result)
+        messages.append({"role": "user", "content": f"Action result: {result}"})
+
+        if is_done:
+            print("[ai-nav] AI signalled completion.")
+            break
+
+    return action_history
+
+
+async def run_navigate(args: argparse.Namespace) -> int:
+    if async_playwright is None:
+        raise RuntimeError("playwright is not installed. Install it before running navigate.")
+
+    start_url = validate_local_url(args.url)
+    output_dir = Path(args.output_dir or f"penten-navigate-{int(time.time())}")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    pages_dir = output_dir / "pages"
+    pages_dir.mkdir(exist_ok=True)
+
+    print("=" * 60)
+    print(f"[penten] target          : {start_url}")
+    print(f"[penten] output          : {output_dir}")
+    print(f"[penten] provider/model  : {args.provider} / {args.model}")
+    print(f"[penten] max-steps       : {args.max_steps}")
+    print("=" * 60)
+
+    network_ops: list[NetworkOperation] = []
+    findings: list[Finding] = []
+
+    async with async_playwright() as playwright:
+        browser = await playwright.chromium.launch(headless=not args.show_browser)
+        print(f"[browser] Chromium launched (headless={not args.show_browser})")
+        context = await browser.new_context(ignore_https_errors=args.ignore_https_errors)
+        page = await context.new_page()
+
+        def on_request(request: Any) -> None:
+            network_ops.append(
+                NetworkOperation(
+                    event="request",
+                    method=request.method,
+                    url=request.url,
+                    status=None,
+                    resource_type=request.resource_type,
+                    timestamp=time.time(),
+                )
+            )
+
+        def on_response(response: Any) -> None:
+            network_ops.append(
+                NetworkOperation(
+                    event="response",
+                    method=response.request.method,
+                    url=response.url,
+                    status=response.status,
+                    resource_type=response.request.resource_type,
+                    timestamp=time.time(),
+                )
+            )
+
+        page.on("request", on_request)
+        page.on("response", on_response)
+
+        action_history = await run_ai_navigation_loop(
+            page=page,
+            start_url=start_url,
+            args=args,
+            findings=findings,
+            network_ops=network_ops,
+        )
+
+        try:
+            final_html = await page.content()
+            (pages_dir / "final-page.html").write_text(final_html, encoding="utf-8")
+        except Exception:
+            pass
+
+        await context.close()
+        await browser.close()
+
+    findings = deduplicate_findings(findings)
+    network_serialized = [asdict(op) for op in network_ops]
+    findings_serialized = [asdict(f) for f in findings]
+
+    report = {
+        "target": start_url,
+        "provider": args.provider,
+        "model": args.model,
+        "mode": "ai_navigate",
+        "action_history": action_history,
+        "findings": findings_serialized,
+        "profile": {
+            "steps_taken": len(action_history),
+            "network_events": len(network_serialized),
+        },
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    (output_dir / "network.json").write_text(json.dumps(network_serialized, indent=2), encoding="utf-8")
+    (output_dir / "report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    print("\n" + "=" * 60)
+    print("[done] AI navigation complete")
+    print(f"[done] Steps taken    : {len(action_history)}")
+    print(f"[done] Findings       : {len(findings_serialized)}")
+    print(f"[done] Report         : {output_dir / 'report.json'}")
+    print(f"[done] Network        : {output_dir / 'network.json'}")
+    print(f"[done] Pages          : {pages_dir}")
+    print("=" * 60)
+    return 0
 
 
 async def run_scan(args: argparse.Namespace) -> int:
@@ -810,6 +1257,46 @@ def build_parser() -> argparse.ArgumentParser:
         default=os.getenv("PENTEN_VAULT_FILE", DEFAULT_VAULT_FILE),
         help="Path to provider token vault file.",
     )
+
+    navigate_parser = subparsers.add_parser(
+        "navigate",
+        help="Let the AI drive the browser to explore and probe the local site.",
+    )
+    navigate_parser.add_argument(
+        "--url", required=True, help="Target URL, must resolve to localhost or 127.0.0.1."
+    )
+    navigate_parser.add_argument(
+        "--provider",
+        default="ollama",
+        choices=SUPPORTED_PROVIDERS,
+        help="AI provider that directs navigation.",
+    )
+    navigate_parser.add_argument("--model", required=True, help="Model name for the selected AI provider.")
+    navigate_parser.add_argument(
+        "--max-steps",
+        type=int,
+        default=AI_NAVIGATE_MAX_STEPS,
+        help="Maximum number of AI navigation steps.",
+    )
+    navigate_parser.add_argument("--timeout", type=int, default=12, help="Per-page timeout in seconds.")
+    navigate_parser.add_argument(
+        "--provider-url",
+        default="",
+        help="Optional provider API base URL override.",
+    )
+    navigate_parser.add_argument(
+        "--vault-file",
+        default=os.getenv("PENTEN_VAULT_FILE", DEFAULT_VAULT_FILE),
+        help="Path to provider token vault file.",
+    )
+    navigate_parser.add_argument(
+        "--ignore-https-errors",
+        action="store_true",
+        help="Ignore HTTPS certificate errors during navigation.",
+    )
+    navigate_parser.add_argument("--output-dir", default="", help="Directory for generated logs and reports.")
+    navigate_parser.add_argument("--show-browser", action="store_true", help="Show browser while navigating.")
+
     return parser
 
 
@@ -823,6 +1310,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         if args.command == "configure":
             return configure_provider(args.provider, args.vault_file)
+        if args.command == "navigate":
+            return asyncio.run(run_navigate(args))
         return asyncio.run(run_scan(args))
     except ValueError as error:
         parser.error(str(error))
