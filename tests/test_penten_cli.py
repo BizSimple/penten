@@ -756,7 +756,7 @@ class GitHubIssuesTests(unittest.TestCase):
         title = _github_issue_title(finding)
         mock_api.side_effect = [
             {"name": "penten"},                      # _ensure_github_label GET
-            [{"title": title, "number": 7}],          # existing issues (1 item -> break)
+            [{"title": title, "number": 7}],          # existing issues (< 100 results, loop breaks)
             {"number": 7, "title": title},             # PATCH update
         ]
         create_or_update_github_issues([finding], "owner/repo", "tok")
