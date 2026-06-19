@@ -24,7 +24,8 @@ class URLHelpersTests(unittest.TestCase):
     def test_is_internal_url(self) -> None:
         self.assertTrue(is_internal_url("localhost", "/relative/path"))
         self.assertTrue(is_internal_url("localhost", "http://localhost/a"))
-        self.assertFalse(is_internal_url("localhost", "http://127.0.0.1/a"))
+        self.assertTrue(is_internal_url("localhost", "http://127.0.0.1/a"))
+        self.assertFalse(is_internal_url("localhost", "http://example.com/a"))
 
     def test_path_from_url(self) -> None:
         self.assertEqual(path_from_url("http://localhost"), "/")

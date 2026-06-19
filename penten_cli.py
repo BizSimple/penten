@@ -16,6 +16,13 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
+try:
+    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
+    from playwright.async_api import async_playwright
+except ImportError:  # pragma: no cover - exercised only without playwright installed
+    PlaywrightTimeoutError = TimeoutError
+    async_playwright = None
+
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1"}
 DEFAULT_INJECTION_PAYLOADS = [
@@ -88,7 +95,11 @@ def is_internal_url(base_host: str, candidate_url: str) -> bool:
     parsed = urllib.parse.urlparse(candidate_url)
     if not parsed.hostname:
         return True
-    return parsed.hostname.lower() == base_host.lower()
+    host = parsed.hostname.lower()
+    base = base_host.lower()
+    if host == base:
+        return True
+    return host in LOCAL_HOSTS and base in LOCAL_HOSTS
 
 
 def path_from_url(url: str) -> str:
@@ -184,6 +195,10 @@ def deduplicate_findings(findings: list[Finding]) -> list[Finding]:
     return deduplicated
 
 
+def deduplicate_strings(items: list[str]) -> list[str]:
+    return list(dict.fromkeys(items))
+
+
 async def fill_and_submit_form(
     context: Any,
     origin_url: str,
@@ -191,8 +206,6 @@ async def fill_and_submit_form(
     payloads: list[str],
     findings: list[Finding],
 ) -> None:
-    from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
     fields = form.get("fields", [])
     if not fields:
         return
@@ -259,6 +272,9 @@ async def fill_and_submit_form(
 
 
 async def run_scan(args: argparse.Namespace) -> int:
+    if async_playwright is None:
+        raise RuntimeError("playwright is not installed. Install it before running scans.")
+
     start_url = validate_local_url(args.url)
     start_host = urllib.parse.urlparse(start_url).hostname or ""
     output_dir = Path(args.output_dir or f"penten-report-{int(time.time())}")
@@ -273,9 +289,7 @@ async def run_scan(args: argparse.Namespace) -> int:
     discovered_forms: list[tuple[str, dict[str, Any]]] = []
     crawl_start = time.perf_counter()
 
-    from playwright.async_api import async_playwright
-
-    payloads = list(dict.fromkeys(DEFAULT_INJECTION_PAYLOADS))
+    payloads = deduplicate_strings(DEFAULT_INJECTION_PAYLOADS)
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not args.show_browser)
@@ -390,7 +404,7 @@ async def run_scan(args: argparse.Namespace) -> int:
                 )
 
         payloads.extend(generate_ai_payloads(args.model, sorted(discovered_paths)))
-        payloads = list(dict.fromkeys(payloads))
+        payloads = deduplicate_strings(payloads)
 
         for path in sorted(discovered_paths):
             base = urllib.parse.urljoin(start_url, path)
