@@ -342,6 +342,7 @@ def run_trufflehog_scan(scan_dir: Path) -> list[dict[str, Any]]:
         ["trufflehog", "filesystem", str(scan_dir), "--json"],
     ]
     for command in commands:
+        print(f"[secrets] Trying: {' '.join(command)}")
         try:
             completed = subprocess.run(
                 command,
@@ -350,8 +351,10 @@ def run_trufflehog_scan(scan_dir: Path) -> list[dict[str, Any]]:
                 text=True,
             )
         except FileNotFoundError:
+            print("[secrets] trufflehog not found in PATH — skipping secret scan.")
             return [{"error": "trufflehog command was not found in PATH."}]
         if completed.returncode not in {0, 1}:
+            print(f"[secrets] Command exited with code {completed.returncode}, trying next syntax ...")
             continue
         findings: list[dict[str, Any]] = []
         for line in completed.stdout.splitlines():
@@ -362,6 +365,7 @@ def run_trufflehog_scan(scan_dir: Path) -> list[dict[str, Any]]:
                 findings.append(json.loads(line))
             except json.JSONDecodeError:
                 findings.append({"raw": line})
+        print(f"[secrets] trufflehog reported {len(findings)} finding(s).")
         return findings
     return [{"error": "Unable to run trufflehog with supported command syntax."}]
 
