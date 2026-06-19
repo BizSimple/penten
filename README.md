@@ -17,11 +17,11 @@ Local CI Pentesting
 
 ### Usage
 ```bash
-python /home/runner/work/penten/penten/penten_cli.py \
+python penten_cli.py \
   --url http://localhost:3000 \
   --model llama3.1 \
   --max-pages 50 \
-  --output-dir /home/runner/work/penten/penten/out
+  --output-dir ./scan-results
 ```
 
 ### Requirements

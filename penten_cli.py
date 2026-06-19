@@ -275,8 +275,7 @@ async def run_scan(args: argparse.Namespace) -> int:
 
     from playwright.async_api import async_playwright
 
-    payloads = DEFAULT_INJECTION_PAYLOADS + generate_ai_payloads(args.model, [])
-    payloads = list(dict.fromkeys(payloads))
+    payloads = list(dict.fromkeys(DEFAULT_INJECTION_PAYLOADS))
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not args.show_browser)
