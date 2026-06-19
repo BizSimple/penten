@@ -114,13 +114,14 @@ def path_from_url(url: str) -> str:
 
 def build_registration_value(field_name: str, field_type: str, index: int, injected: bool, payload: str) -> str:
     lower_name = field_name.lower()
+    name_tokens = {token for token in re.split(r"[^a-z0-9]+", lower_name) if token}
     if injected and field_type not in {"email", "password", "hidden"}:
         return payload
     if "mail" in lower_name or field_type == "email":
         return f"penten{index}@example.com"
     if "pass" in lower_name or field_type == "password":
         return "StrongPass123!"
-    if "user" in lower_name or "name" in lower_name:
+    if {"user", "username", "name", "fullname"} & name_tokens:
         return f"penten_user_{index}"
     if field_type in {"checkbox", "radio"}:
         return "on"
@@ -145,7 +146,7 @@ def generate_ai_payloads(model: str, discovered_paths: list[str], ollama_url: st
     try:
         with urllib.request.urlopen(request, timeout=OLLAMA_TIMEOUT_SECONDS) as response:
             body = response.read().decode("utf-8")
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+    except (urllib.error.URLError, TimeoutError) as error:
         print(f"Warning: failed to query Ollama for payloads ({error}). Using default payloads.")
         return []
     try:

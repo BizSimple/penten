@@ -45,7 +45,7 @@ class FormValueTests(unittest.TestCase):
     def test_registration_values(self) -> None:
         self.assertEqual(build_registration_value("email", "email", 1, False, "X"), "penten1@example.com")
         self.assertEqual(build_registration_value("password", "password", 0, False, "X"), "StrongPass123!")
-        self.assertIn("penten_user_", build_registration_value("username", "text", 0, False, "X"))
+        self.assertEqual(build_registration_value("username", "text", 0, False, "X"), "penten_user_0")
 
     def test_injected_prefers_payload_for_text(self) -> None:
         self.assertEqual(build_registration_value("name", "text", 0, True, "PAYLOAD"), "PAYLOAD")
