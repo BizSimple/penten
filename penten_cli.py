@@ -347,7 +347,6 @@ def request_ai_navigation_action(
             msg = response.get("message")
             if isinstance(msg, dict):
                 return str(msg.get("content", ""))
-            # Older Ollama versions may expose response at top level
             return str(response.get("response", ""))
 
         if provider_name in {"deepseek", "glm"}:

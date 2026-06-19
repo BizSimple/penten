@@ -74,6 +74,50 @@ Store provider credentials in the vault.
 - `--provider` one of `ollama`, `deepseek`, `glm`, `gemini`
 - `--vault-file` provider token vault path (default: `~/.penten/vault.json`)
 
+### `navigate`
+Let the AI model autonomously drive the browser to explore and probe the local site.
+
+In this mode the script runs an agentic loop: Playwright navigates the current page and
+captures its HTML structure, browser console messages, and network activity.  That context
+is sent to the AI model, which responds with a JSON action object (see below).  The script
+executes the action and feeds the result back to the model, repeating until the model
+signals it is done or `--max-steps` is reached.
+
+Available AI actions:
+
+| Action | Effect |
+|---|---|
+| `{"action":"navigate","url":"<url>"}` | Navigate to a URL (local only) |
+| `{"action":"click","selector":"<css>"}` | Click an element by CSS selector |
+| `{"action":"click_text","text":"<text>"}` | Click a visible element by text |
+| `{"action":"fill","selector":"<css>","value":"<val>"}` | Fill a form field |
+| `{"action":"report_finding","category":"<slug>","severity":"high\|medium\|low","detail":"<desc>"}` | Record a security finding |
+| `{"action":"done","summary":"<text>"}` | Signal exploration is complete |
+
+Example:
+```bash
+python penten_cli.py navigate \
+  --url http://localhost:3000 \
+  --provider ollama \
+  --model llama3.1 \
+  --max-steps 20 \
+  --output-dir ./navigate-results
+```
+
+Required:
+- `--url` target URL (must resolve to `localhost` or `127.0.0.1`)
+- `--model` model name for the selected provider
+
+Options:
+- `--provider` AI provider (`ollama`, `deepseek`, `glm`, `gemini`) (default: `ollama`)
+- `--max-steps` maximum AI navigation steps (default: `20`)
+- `--timeout` per-page timeout in seconds (default: `12`)
+- `--provider-url` provider API base URL override
+- `--vault-file` provider token vault path (default: `~/.penten/vault.json`)
+- `--ignore-https-errors` ignore local HTTPS certificate errors
+- `--output-dir` output directory (default: `penten-navigate-<timestamp>`)
+- `--show-browser` run with visible browser window
+
 ## Provider details
 
 - **Ollama** (`--provider ollama`): default URL `http://127.0.0.1:11434`

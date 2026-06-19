@@ -508,10 +508,9 @@ class RunAiNavigationLoopTests(unittest.TestCase):
 
     @patch("penten_cli.request_ai_navigation_action")
     def test_loop_handles_parse_failure_then_recovers(self, mock_ai) -> None:
+        # First response cannot be parsed; second response is a valid done action.
         responses = iter(["not json at all", '{"action":"done","summary":"ok"}'])
-        mock_ai.side_effect = lambda **_kw: next(responses, None)
-        mock_ai.side_effect = None
-        mock_ai.return_value = '{"action":"done","summary":"ok"}'
+        mock_ai.side_effect = lambda *_a, **_kw: next(responses, None)
         page = self._make_page()
         history = self._run(
             run_ai_navigation_loop(page, "http://localhost/", self._make_args(max_steps=3), [], [])
