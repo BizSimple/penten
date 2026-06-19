@@ -11,18 +11,22 @@ from penten_cli import (
     build_parser,
     build_registration_value,
     configure_provider,
+    create_or_update_github_issues,
     execute_navigation_action,
     generate_ai_payloads,
     is_internal_url,
     load_vault,
     path_from_url,
     request_ai_navigation_action,
+    resolve_github_token,
     resolve_provider_api_key,
     resolve_provider_url,
     run_ai_navigation_loop,
     save_vault,
     summarize_page_for_ai,
     validate_local_url,
+    _github_api_request,
+    _github_issue_title,
     _parse_navigation_action,
 )
 
@@ -661,6 +665,152 @@ class RunAiNavigationLoopTests(unittest.TestCase):
             run_ai_navigation_loop(page, "http://localhost/", self._make_args(max_steps=3), [], [])
         )
         self.assertTrue(any("done" in h for h in history))
+
+
+class GitHubIssuesTests(unittest.TestCase):
+    def _finding(self, severity="high", category="sqli", url="http://localhost/login", detail="detail") -> Finding:
+        return Finding(category=category, severity=severity, url=url, detail=detail)
+
+    # --- resolve_github_token ---
+
+    def test_resolve_github_token_prefers_flag(self) -> None:
+        with patch.dict("os.environ", {"GITHUB_TOKEN": "env-tok"}, clear=True):
+            self.assertEqual(resolve_github_token("flag-tok"), "flag-tok")
+
+    def test_resolve_github_token_falls_back_to_env(self) -> None:
+        with patch.dict("os.environ", {"GITHUB_TOKEN": "env-tok"}, clear=True):
+            self.assertEqual(resolve_github_token(""), "env-tok")
+
+    def test_resolve_github_token_falls_back_to_gh_token(self) -> None:
+        with patch.dict("os.environ", {"GH_TOKEN": "gh-tok"}, clear=True):
+            self.assertEqual(resolve_github_token(""), "gh-tok")
+
+    def test_resolve_github_token_returns_empty_when_none(self) -> None:
+        with patch.dict("os.environ", {}, clear=True):
+            self.assertEqual(resolve_github_token(""), "")
+
+    # --- _github_issue_title ---
+
+    def test_github_issue_title_format(self) -> None:
+        finding = self._finding(severity="high", category="sqli", url="http://localhost/login")
+        title = _github_issue_title(finding)
+        self.assertIn("[penten]", title)
+        self.assertIn("HIGH", title)
+        self.assertIn("sqli", title)
+        self.assertIn("http://localhost/login", title)
+
+    # --- _github_api_request ---
+
+    @patch("urllib.request.urlopen")
+    def test_github_api_request_returns_dict(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = FakeHTTPResponse('{"number": 1, "title": "t"}')
+        result = _github_api_request("GET", "/repos/o/r/issues/1", "tok")
+        self.assertIsInstance(result, dict)
+        self.assertEqual(result["number"], 1)
+
+    @patch("urllib.request.urlopen")
+    def test_github_api_request_returns_list(self, mock_urlopen) -> None:
+        mock_urlopen.return_value = FakeHTTPResponse('[{"number": 1}]')
+        result = _github_api_request("GET", "/repos/o/r/issues", "tok")
+        self.assertIsInstance(result, list)
+
+    @patch("urllib.request.urlopen", side_effect=urllib.error.URLError("err"))
+    def test_github_api_request_returns_none_on_error(self, _mock) -> None:
+        result = _github_api_request("GET", "/repos/o/r/issues", "tok")
+        self.assertIsNone(result)
+
+    # --- create_or_update_github_issues ---
+
+    def test_create_or_update_no_token_prints_message(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            create_or_update_github_issues([self._finding()], "owner/repo", "")
+        self.assertIn("No GitHub token", buf.getvalue())
+
+    def test_create_or_update_invalid_repo_prints_message(self) -> None:
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            create_or_update_github_issues([self._finding()], "badrepo", "tok")
+        self.assertIn("Invalid repo", buf.getvalue())
+
+    @patch("penten_cli._github_api_request")
+    def test_create_or_update_creates_new_issue(self, mock_api) -> None:
+        # Label exists, no existing issues, creation succeeds.
+        mock_api.side_effect = [
+            {"name": "penten"},          # _ensure_github_label GET
+            [],                           # list existing issues
+            {"number": 42, "title": "t"}, # create issue
+        ]
+        create_or_update_github_issues([self._finding()], "owner/repo", "tok")
+        create_call = mock_api.call_args_list[2]
+        self.assertEqual(create_call[0][0], "POST")
+        self.assertIn("/issues", create_call[0][1])
+
+    @patch("penten_cli._github_api_request")
+    def test_create_or_update_updates_existing_issue(self, mock_api) -> None:
+        finding = self._finding()
+        title = _github_issue_title(finding)
+        mock_api.side_effect = [
+            {"name": "penten"},                      # _ensure_github_label GET
+            [{"title": title, "number": 7}],          # existing issues (1 item -> break)
+            {"number": 7, "title": title},             # PATCH update
+        ]
+        create_or_update_github_issues([finding], "owner/repo", "tok")
+        patch_call = mock_api.call_args_list[2]
+        self.assertEqual(patch_call[0][0], "PATCH")
+        self.assertIn("/issues/7", patch_call[0][1])
+
+    @patch("penten_cli._github_api_request")
+    def test_create_or_update_creates_label_when_missing(self, mock_api) -> None:
+        mock_api.side_effect = [
+            None,                           # _ensure_github_label GET returns None (missing)
+            {"name": "penten"},             # _ensure_github_label POST
+            [],                             # list existing issues
+            {"number": 1, "title": "t"},    # create issue
+        ]
+        create_or_update_github_issues([self._finding()], "owner/repo", "tok")
+        post_label_call = mock_api.call_args_list[1]
+        self.assertEqual(post_label_call[0][0], "POST")
+        self.assertIn("/labels", post_label_call[0][1])
+
+
+class ParserGitHubFlagTests(unittest.TestCase):
+    def test_scan_github_issues_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([
+            "scan", "--url", "http://localhost:3000", "--model", "llama3",
+            "--github-issues", "--github-repo", "owner/repo", "--github-token", "tok",
+        ])
+        self.assertTrue(args.github_issues)
+        self.assertEqual(args.github_repo, "owner/repo")
+        self.assertEqual(args.github_token, "tok")
+
+    def test_scan_github_issues_defaults(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["scan", "--url", "http://localhost:3000", "--model", "m"])
+        self.assertFalse(args.github_issues)
+        self.assertEqual(args.github_repo, "")
+        self.assertEqual(args.github_token, "")
+
+    def test_navigate_github_issues_flag(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args([
+            "navigate", "--url", "http://localhost:3000", "--model", "llama3",
+            "--github-issues", "--github-repo", "owner/repo",
+        ])
+        self.assertTrue(args.github_issues)
+        self.assertEqual(args.github_repo, "owner/repo")
+
+    def test_navigate_github_issues_defaults(self) -> None:
+        parser = build_parser()
+        args = parser.parse_args(["navigate", "--url", "http://localhost:3000", "--model", "m"])
+        self.assertFalse(args.github_issues)
+        self.assertEqual(args.github_repo, "")
+        self.assertEqual(args.github_token, "")
 
 
 if __name__ == "__main__":

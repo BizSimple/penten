@@ -33,6 +33,8 @@ AI_PATH_CONTEXT_LIMIT = 30
 AI_TIMEOUT_SECONDS = 30
 SUPPORTED_PROVIDERS = ("ollama", "deepseek", "glm", "gemini")
 SUPPORTED_COMMANDS = ("scan", "configure", "navigate")
+GITHUB_API_BASE = "https://api.github.com"
+GITHUB_ISSUE_LABEL = "penten"
 AI_NAVIGATE_MAX_STEPS = 20
 AI_NAVIGATE_CONSOLE_LIMIT = 20
 AI_NAVIGATE_NETWORK_LIMIT = 20
@@ -550,6 +552,136 @@ def deduplicate_strings(items: list[str]) -> list[str]:
     return list(dict.fromkeys(items))
 
 
+def resolve_github_token(flag_token: str) -> str:
+    """Return the GitHub token from *flag_token*, then GITHUB_TOKEN, then GH_TOKEN env vars."""
+    return flag_token or os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN", "")
+
+
+def _github_api_request(
+    method: str,
+    path: str,
+    token: str,
+    body: dict[str, Any] | None = None,
+) -> dict[str, Any] | list[Any] | None:
+    """Make a single GitHub REST API call and return the parsed JSON response, or None on error."""
+    url = f"{GITHUB_API_BASE}{path}"
+    data = json.dumps(body).encode("utf-8") if body is not None else None
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Content-Type": "application/json",
+            "User-Agent": "penten-cli",
+        },
+        method=method,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        print(f"[github] API {method} {path} failed: HTTP {exc.code}")
+        return None
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
+        print(f"[github] API request failed: {exc}")
+        return None
+
+
+def _ensure_github_label(repo: str, token: str) -> None:
+    """Create the penten label in *repo* if it does not already exist."""
+    result = _github_api_request("GET", f"/repos/{repo}/labels/{GITHUB_ISSUE_LABEL}", token)
+    if isinstance(result, dict) and result.get("name"):
+        return
+    _github_api_request(
+        "POST",
+        f"/repos/{repo}/labels",
+        token,
+        {
+            "name": GITHUB_ISSUE_LABEL,
+            "color": "e11d48",
+            "description": "Security finding from penten scan",
+        },
+    )
+
+
+def _github_issue_title(finding: Finding) -> str:
+    return f"[penten] {finding.severity.upper()}: {finding.category} on {finding.url}"
+
+
+def create_or_update_github_issues(
+    findings: list[Finding],
+    repo: str,
+    token: str,
+) -> None:
+    """Create or update one GitHub issue per finding in *findings*.
+
+    Existing open issues carrying the ``penten`` label whose title matches a
+    finding are updated instead of duplicated.  Requires a GitHub personal
+    access token with *repo* or *issues:write* scope.
+    """
+    if not token:
+        print("[github] No GitHub token provided — skipping issue creation.")
+        return
+    if not repo or "/" not in repo:
+        print(f"[github] Invalid repo '{repo}' — expected 'owner/repo'.")
+        return
+
+    _ensure_github_label(repo, token)
+
+    # Collect existing open penten issues to detect duplicates.
+    existing: dict[str, int] = {}  # title -> issue number
+    page = 1
+    while True:
+        result = _github_api_request(
+            "GET",
+            f"/repos/{repo}/issues?state=open&labels={GITHUB_ISSUE_LABEL}&per_page=100&page={page}",
+            token,
+        )
+        if not isinstance(result, list) or not result:
+            break
+        for issue in result:
+            if isinstance(issue, dict):
+                existing[issue.get("title", "")] = issue.get("number", 0)
+        if len(result) < 100:
+            break
+        page += 1
+
+    for finding in findings:
+        title = _github_issue_title(finding)
+        body = (
+            f"**Severity:** {finding.severity}\n"
+            f"**Category:** {finding.category}\n"
+            f"**URL:** {finding.url}\n\n"
+            f"**Detail:**\n{finding.detail}\n\n"
+            f"---\n*Reported by penten*"
+        )
+        if title in existing:
+            issue_number = existing[title]
+            result = _github_api_request(
+                "PATCH",
+                f"/repos/{repo}/issues/{issue_number}",
+                token,
+                {"body": body, "state": "open"},
+            )
+            if isinstance(result, dict) and result.get("number"):
+                print(f"[github] Updated issue #{issue_number}: {title}")
+            else:
+                print(f"[github] Failed to update issue #{issue_number}")
+        else:
+            result = _github_api_request(
+                "POST",
+                f"/repos/{repo}/issues",
+                token,
+                {"title": title, "body": body, "labels": [GITHUB_ISSUE_LABEL]},
+            )
+            if isinstance(result, dict) and result.get("number"):
+                print(f"[github] Created issue #{result['number']}: {title}")
+            else:
+                print(f"[github] Failed to create issue: {title}")
+
+
 async def fill_and_submit_form(
     context: Any,
     origin_url: str,
@@ -969,6 +1101,11 @@ async def run_navigate(args: argparse.Namespace) -> int:
     print(f"[done] Network        : {output_dir / 'network.json'}")
     print(f"[done] Pages          : {pages_dir}")
     print("=" * 60)
+
+    if getattr(args, "github_issues", False):
+        github_token = resolve_github_token(getattr(args, "github_token", ""))
+        create_or_update_github_issues(findings, getattr(args, "github_repo", ""), github_token)
+
     return 0
 
 
@@ -1264,6 +1401,11 @@ async def run_scan(args: argparse.Namespace) -> int:
     print(f"[done] Network: {output_dir / 'network.json'}")
     print(f"[done] Pages  : {pages_dir}")
     print("=" * 60)
+
+    if getattr(args, "github_issues", False):
+        github_token = resolve_github_token(getattr(args, "github_token", ""))
+        create_or_update_github_issues(findings, getattr(args, "github_repo", ""), github_token)
+
     return 0
 
 
@@ -1308,6 +1450,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scan_parser.add_argument("--output-dir", default="", help="Directory for generated logs and reports.")
     scan_parser.add_argument("--show-browser", action="store_true", help="Show browser while scanning.")
+    scan_parser.add_argument(
+        "--github-issues",
+        action="store_true",
+        help="Create or update GitHub issues for each finding.",
+    )
+    scan_parser.add_argument(
+        "--github-repo",
+        default="",
+        help="GitHub repository for issue creation in 'owner/repo' format.",
+    )
+    scan_parser.add_argument(
+        "--github-token",
+        default="",
+        help="GitHub personal access token (defaults to GITHUB_TOKEN / GH_TOKEN env var).",
+    )
 
     configure_parser = subparsers.add_parser("configure", help="Store provider credentials in vault.")
     configure_parser.add_argument(
@@ -1364,6 +1521,21 @@ def build_parser() -> argparse.ArgumentParser:
         "--source-dir",
         default="",
         help="Path to application source directory; enables read_file and list_files actions.",
+    )
+    navigate_parser.add_argument(
+        "--github-issues",
+        action="store_true",
+        help="Create or update GitHub issues for each finding.",
+    )
+    navigate_parser.add_argument(
+        "--github-repo",
+        default="",
+        help="GitHub repository for issue creation in 'owner/repo' format.",
+    )
+    navigate_parser.add_argument(
+        "--github-token",
+        default="",
+        help="GitHub personal access token (defaults to GITHUB_TOKEN / GH_TOKEN env var).",
     )
 
     return parser
