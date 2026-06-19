@@ -92,6 +92,8 @@ Available AI actions:
 | `{"action":"click_text","text":"<text>"}` | Click a visible element by text |
 | `{"action":"fill","selector":"<css>","value":"<val>"}` | Fill a form field |
 | `{"action":"report_finding","category":"<slug>","severity":"high\|medium\|low","detail":"<desc>"}` | Record a security finding |
+| `{"action":"list_files","path":"<relative-path>"}` | List files in a source directory (requires `--source-dir`) |
+| `{"action":"read_file","path":"<relative-path>"}` | Read a source file (requires `--source-dir`) |
 | `{"action":"done","summary":"<text>"}` | Signal exploration is complete |
 
 Example:
@@ -117,6 +119,7 @@ Options:
 - `--ignore-https-errors` ignore local HTTPS certificate errors
 - `--output-dir` output directory (default: `penten-navigate-<timestamp>`)
 - `--show-browser` run with visible browser window
+- `--source-dir` path to the application source directory; enables `list_files` and `read_file` AI actions
 
 ## Provider details
 
