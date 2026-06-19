@@ -37,6 +37,8 @@ AI_NAVIGATE_MAX_STEPS = 20
 AI_NAVIGATE_CONSOLE_LIMIT = 20
 AI_NAVIGATE_NETWORK_LIMIT = 20
 AI_NAVIGATE_SUMMARY_LINKS = 30
+AI_SOURCE_FILE_SIZE_LIMIT = 50_000
+AI_SOURCE_LIST_LIMIT = 100
 AI_NAVIGATE_SYSTEM_PROMPT = (
     "You are an autonomous web security tester driving a browser. "
     "At each step you receive the current page state (URL, structural summary, "
@@ -48,10 +50,14 @@ AI_NAVIGATE_SYSTEM_PROMPT = (
     '  {"action":"click_text","text":"<visible-button-or-link-text>"}\n'
     '  {"action":"fill","selector":"<css-selector>","value":"<value>"}\n'
     '  {"action":"report_finding","category":"<slug>","severity":"high|medium|low","detail":"<description>"}\n'
+    '  {"action":"list_files","path":"<relative-directory-path>"}\n'
+    '  {"action":"read_file","path":"<relative-file-path>"}\n'
     '  {"action":"done","summary":"<exploration-summary>"}\n'
     "Focus on: discovering hidden/sensitive paths, unprotected admin panels, "
     "authentication bypass, reflected/stored injection vulnerabilities, and "
-    "exposed private data. Stay within the local target host only."
+    "exposed private data. Stay within the local target host only. "
+    "Use list_files and read_file to inspect the application source code when "
+    "a source directory is available (path is relative to that directory)."
 )
 DEFAULT_PROVIDER_URLS = {
     "ollama": "http://127.0.0.1:11434",
@@ -620,11 +626,26 @@ async def fill_and_submit_form(
             await page.close()
 
 
+def _safe_resolve_source_path(source_dir: str, relative_path: str) -> Path | None:
+    """Resolve *relative_path* inside *source_dir*, returning None on traversal attempts."""
+    base = Path(source_dir).resolve()
+    try:
+        target = (base / relative_path).resolve()
+    except (ValueError, OSError):
+        return None
+    try:
+        target.relative_to(base)
+    except ValueError:
+        return None
+    return target
+
+
 async def execute_navigation_action(
     page: Any,
     action: dict[str, Any],
     start_host: str,
     findings: list[Finding],
+    source_dir: str | None = None,
 ) -> tuple[bool, str]:
     """Execute one AI-chosen navigation action via Playwright.
 
@@ -704,6 +725,47 @@ async def execute_navigation_action(
         )
         return False, f"[ai-nav] finding [{severity}] {category}: {detail}"
 
+    if action_name == "list_files":
+        if source_dir is None:
+            return False, "[ai-nav] list_files: no source directory configured (use --source-dir)"
+        rel_path = str(action.get("path", ".") or ".")
+        target = _safe_resolve_source_path(source_dir, rel_path)
+        if target is None:
+            return False, f"[ai-nav] list_files: path traversal blocked for {rel_path!r}"
+        if not target.is_dir():
+            return False, f"[ai-nav] list_files: not a directory: {rel_path!r}"
+        try:
+            entries = sorted(target.iterdir(), key=lambda p: (p.is_file(), p.name))
+            lines = [
+                f"{'d' if e.is_dir() else 'f'}  {e.name}"
+                for e in entries[:AI_SOURCE_LIST_LIMIT]
+            ]
+            if len(entries) > AI_SOURCE_LIST_LIMIT:
+                lines.append(f"... ({len(entries) - AI_SOURCE_LIST_LIMIT} more entries)")
+            listing = "\n".join(lines) if lines else "(empty directory)"
+            return False, f"[ai-nav] list_files {rel_path!r}:\n{listing}"
+        except OSError as exc:
+            return False, f"[ai-nav] list_files error: {exc}"
+
+    if action_name == "read_file":
+        if source_dir is None:
+            return False, "[ai-nav] read_file: no source directory configured (use --source-dir)"
+        rel_path = str(action.get("path", "") or "")
+        if not rel_path:
+            return False, "[ai-nav] read_file: missing path"
+        target = _safe_resolve_source_path(source_dir, rel_path)
+        if target is None:
+            return False, f"[ai-nav] read_file: path traversal blocked for {rel_path!r}"
+        if not target.is_file():
+            return False, f"[ai-nav] read_file: not a file: {rel_path!r}"
+        try:
+            content = target.read_text(encoding="utf-8", errors="replace")
+            if len(content) > AI_SOURCE_FILE_SIZE_LIMIT:
+                content = content[:AI_SOURCE_FILE_SIZE_LIMIT] + f"\n... (truncated at {AI_SOURCE_FILE_SIZE_LIMIT} chars)"
+            return False, f"[ai-nav] read_file {rel_path!r}:\n{content}"
+        except OSError as exc:
+            return False, f"[ai-nav] read_file error: {exc}"
+
     return False, f"[ai-nav] unknown action: {action_name!r}"
 
 
@@ -721,6 +783,7 @@ async def run_ai_navigation_loop(
     provider_url = resolve_provider_url(args.provider, args.provider_url)
     api_key = resolve_provider_api_key(args.provider, args.vault_file)
     start_host = urllib.parse.urlparse(start_url).hostname or ""
+    source_dir: str | None = getattr(args, "source_dir", None) or None
 
     console_logs: list[str] = []
     page.on("console", lambda msg: console_logs.append(f"[{msg.type}] {msg.text}"))
@@ -734,6 +797,8 @@ async def run_ai_navigation_loop(
         f"\n[ai-nav] Starting AI-driven navigation "
         f"(provider={args.provider}, model={args.model}, max-steps={args.max_steps}) ..."
     )
+    if source_dir:
+        print(f"[ai-nav] Source directory : {source_dir}")
 
     try:
         await page.goto(start_url, wait_until="domcontentloaded", timeout=args.timeout * 1000)
@@ -792,7 +857,7 @@ async def run_ai_navigation_loop(
             continue
 
         is_done, result = await execute_navigation_action(
-            page, action, start_host, findings
+            page, action, start_host, findings, source_dir
         )
         print(result)
         action_history.append(result)
@@ -1295,6 +1360,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     navigate_parser.add_argument("--output-dir", default="", help="Directory for generated logs and reports.")
     navigate_parser.add_argument("--show-browser", action="store_true", help="Show browser while navigating.")
+    navigate_parser.add_argument(
+        "--source-dir",
+        default="",
+        help="Path to application source directory; enables read_file and list_files actions.",
+    )
 
     return parser
 

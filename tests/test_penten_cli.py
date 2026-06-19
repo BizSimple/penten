@@ -454,6 +454,151 @@ class ExecuteNavigationActionTests(unittest.TestCase):
         self.assertFalse(is_done)
         self.assertIn("unknown", msg)
 
+    # --- list_files ---
+
+    def test_list_files_no_source_dir(self) -> None:
+        page = self._make_page()
+        is_done, msg = self._run(
+            execute_navigation_action(
+                page, {"action": "list_files", "path": "."}, "localhost", [], source_dir=None
+            )
+        )
+        self.assertFalse(is_done)
+        self.assertIn("no source directory", msg)
+
+    def test_list_files_lists_directory(self) -> None:
+        page = self._make_page()
+        with TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "app.py").write_text("# app")
+            Path(tmpdir, "subdir").mkdir()
+            is_done, msg = self._run(
+                execute_navigation_action(
+                    page, {"action": "list_files", "path": "."}, "localhost", [], source_dir=tmpdir
+                )
+            )
+        self.assertFalse(is_done)
+        self.assertIn("app.py", msg)
+        self.assertIn("subdir", msg)
+
+    def test_list_files_blocks_path_traversal(self) -> None:
+        page = self._make_page()
+        with TemporaryDirectory() as tmpdir:
+            is_done, msg = self._run(
+                execute_navigation_action(
+                    page,
+                    {"action": "list_files", "path": "../../etc"},
+                    "localhost",
+                    [],
+                    source_dir=tmpdir,
+                )
+            )
+        self.assertFalse(is_done)
+        self.assertIn("traversal", msg)
+
+    def test_list_files_not_a_directory(self) -> None:
+        page = self._make_page()
+        with TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "file.txt").write_text("data")
+            is_done, msg = self._run(
+                execute_navigation_action(
+                    page,
+                    {"action": "list_files", "path": "file.txt"},
+                    "localhost",
+                    [],
+                    source_dir=tmpdir,
+                )
+            )
+        self.assertFalse(is_done)
+        self.assertIn("not a directory", msg)
+
+    # --- read_file ---
+
+    def test_read_file_no_source_dir(self) -> None:
+        page = self._make_page()
+        is_done, msg = self._run(
+            execute_navigation_action(
+                page, {"action": "read_file", "path": "app.py"}, "localhost", [], source_dir=None
+            )
+        )
+        self.assertFalse(is_done)
+        self.assertIn("no source directory", msg)
+
+    def test_read_file_reads_content(self) -> None:
+        page = self._make_page()
+        with TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "app.py").write_text("print('hello')")
+            is_done, msg = self._run(
+                execute_navigation_action(
+                    page,
+                    {"action": "read_file", "path": "app.py"},
+                    "localhost",
+                    [],
+                    source_dir=tmpdir,
+                )
+            )
+        self.assertFalse(is_done)
+        self.assertIn("print('hello')", msg)
+
+    def test_read_file_blocks_path_traversal(self) -> None:
+        page = self._make_page()
+        with TemporaryDirectory() as tmpdir:
+            is_done, msg = self._run(
+                execute_navigation_action(
+                    page,
+                    {"action": "read_file", "path": "../../etc/passwd"},
+                    "localhost",
+                    [],
+                    source_dir=tmpdir,
+                )
+            )
+        self.assertFalse(is_done)
+        self.assertIn("traversal", msg)
+
+    def test_read_file_missing_path(self) -> None:
+        page = self._make_page()
+        with TemporaryDirectory() as tmpdir:
+            is_done, msg = self._run(
+                execute_navigation_action(
+                    page, {"action": "read_file"}, "localhost", [], source_dir=tmpdir
+                )
+            )
+        self.assertFalse(is_done)
+        self.assertIn("missing path", msg)
+
+    def test_read_file_not_a_file(self) -> None:
+        page = self._make_page()
+        with TemporaryDirectory() as tmpdir:
+            Path(tmpdir, "subdir").mkdir()
+            is_done, msg = self._run(
+                execute_navigation_action(
+                    page,
+                    {"action": "read_file", "path": "subdir"},
+                    "localhost",
+                    [],
+                    source_dir=tmpdir,
+                )
+            )
+        self.assertFalse(is_done)
+        self.assertIn("not a file", msg)
+
+    def test_read_file_truncates_large_content(self) -> None:
+        from penten_cli import AI_SOURCE_FILE_SIZE_LIMIT
+        page = self._make_page()
+        with TemporaryDirectory() as tmpdir:
+            big = "x" * (AI_SOURCE_FILE_SIZE_LIMIT + 100)
+            Path(tmpdir, "big.txt").write_text(big)
+            is_done, msg = self._run(
+                execute_navigation_action(
+                    page,
+                    {"action": "read_file", "path": "big.txt"},
+                    "localhost",
+                    [],
+                    source_dir=tmpdir,
+                )
+            )
+        self.assertFalse(is_done)
+        self.assertIn("truncated", msg)
+
 
 class RunAiNavigationLoopTests(unittest.TestCase):
     def _run(self, coro):
