@@ -21,6 +21,7 @@ python penten_cli.py \
   --url http://localhost:3000 \
   --model llama3.1 \
   --max-pages 50 \
+  --ollama-url http://127.0.0.1:11434 \
   --output-dir ./scan-results
 ```
 

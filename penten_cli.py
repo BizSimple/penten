@@ -2,6 +2,7 @@
 import argparse
 import asyncio
 import json
+import os
 import re
 import subprocess
 import sys
@@ -25,6 +26,8 @@ except ImportError:  # pragma: no cover - exercised only without playwright inst
 
 
 LOCAL_HOSTS = {"localhost", "127.0.0.1"}
+SENSITIVE_PATH_PATTERN = re.compile(r"/(admin|internal|private|debug)", flags=re.I)
+MAX_PAYLOADS_PER_PATH = 3
 DEFAULT_INJECTION_PAYLOADS = [
     "' OR '1'='1",
     "<script>alert(1)</script>",
@@ -122,7 +125,7 @@ def build_registration_value(field_name: str, field_type: str, index: int, injec
     return f"value_{index}"
 
 
-def generate_ai_payloads(model: str, discovered_paths: list[str]) -> list[str]:
+def generate_ai_payloads(model: str, discovered_paths: list[str], ollama_url: str) -> list[str]:
     payload_prompt = (
         "Return 5 web security injection payloads as a JSON array of strings. "
         "Prioritize SQLi, XSS, SSTI and path traversal. Paths observed: "
@@ -132,7 +135,7 @@ def generate_ai_payloads(model: str, discovered_paths: list[str]) -> list[str]:
         {"model": model, "prompt": payload_prompt, "stream": False, "format": "json"}
     ).encode("utf-8")
     request = urllib.request.Request(
-        "http://127.0.0.1:11434/api/generate",
+        ollama_url.rstrip("/") + "/api/generate",
         data=request_data,
         headers={"Content-Type": "application/json"},
         method="POST",
@@ -140,7 +143,8 @@ def generate_ai_payloads(model: str, discovered_paths: list[str]) -> list[str]:
     try:
         with urllib.request.urlopen(request, timeout=30) as response:
             body = response.read().decode("utf-8")
-    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError):
+    except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as error:
+        print(f"Warning: failed to query Ollama for payloads ({error}). Using default payloads.")
         return []
     try:
         parsed = json.loads(body)
@@ -155,6 +159,7 @@ def generate_ai_payloads(model: str, discovered_paths: list[str]) -> list[str]:
 
 
 def run_trufflehog_scan(scan_dir: Path) -> list[dict[str, Any]]:
+    # Try both command syntaxes for compatibility across trufflehog versions.
     commands = [
         ["trufflehog", "filesystem", "--json", str(scan_dir)],
         ["trufflehog", "filesystem", str(scan_dir), "--json"],
@@ -293,7 +298,7 @@ async def run_scan(args: argparse.Namespace) -> int:
 
     async with async_playwright() as playwright:
         browser = await playwright.chromium.launch(headless=not args.show_browser)
-        context = await browser.new_context(ignore_https_errors=True)
+        context = await browser.new_context(ignore_https_errors=args.ignore_https_errors)
         page = await context.new_page()
 
         def on_request(request: Any) -> None:
@@ -365,7 +370,7 @@ async def run_scan(args: argparse.Namespace) -> int:
                             detail="API-like endpoint was accessible without obvious authentication.",
                         )
                     )
-                if re.search(r"/(admin|internal|private|debug)", path_from_url(current), flags=re.I) and status in {
+                if SENSITIVE_PATH_PATTERN.search(path_from_url(current)) and status in {
                     200,
                     201,
                     202,
@@ -403,12 +408,12 @@ async def run_scan(args: argparse.Namespace) -> int:
                     )
                 )
 
-        payloads.extend(generate_ai_payloads(args.model, sorted(discovered_paths)))
+        payloads.extend(generate_ai_payloads(args.model, sorted(discovered_paths), args.ollama_url))
         payloads = deduplicate_strings(payloads)
 
         for path in sorted(discovered_paths):
             base = urllib.parse.urljoin(start_url, path)
-            for payload in payloads[:3]:
+            for payload in payloads[:MAX_PAYLOADS_PER_PATH]:
                 attack_url = f"{base}?penten_probe={urllib.parse.quote(payload)}"
                 try:
                     response = await page.goto(attack_url, wait_until="domcontentloaded", timeout=args.timeout * 1000)
@@ -513,6 +518,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-pages", type=int, default=50, help="Maximum number of pages to crawl.")
     parser.add_argument("--max-forms", type=int, default=20, help="Maximum number of forms to exercise.")
     parser.add_argument("--timeout", type=int, default=12, help="Per-page timeout in seconds.")
+    parser.add_argument(
+        "--ollama-url",
+        default=os.getenv("OLLAMA_API_URL", "http://127.0.0.1:11434"),
+        help="Base URL for local Ollama API.",
+    )
+    parser.add_argument(
+        "--ignore-https-errors",
+        action="store_true",
+        help="Ignore HTTPS certificate errors during local scanning.",
+    )
     parser.add_argument("--output-dir", default="", help="Directory for generated logs and reports.")
     parser.add_argument("--show-browser", action="store_true", help="Show browser while scanning.")
     return parser

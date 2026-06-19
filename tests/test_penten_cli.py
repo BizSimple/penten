@@ -34,7 +34,7 @@ class URLHelpersTests(unittest.TestCase):
 
 class FormValueTests(unittest.TestCase):
     def test_registration_values(self) -> None:
-        self.assertIn("@example.com", build_registration_value("email", "email", 1, False, "X"))
+        self.assertEqual(build_registration_value("email", "email", 1, False, "X"), "penten1@example.com")
         self.assertEqual(build_registration_value("password", "password", 0, False, "X"), "StrongPass123!")
         self.assertIn("penten_user_", build_registration_value("username", "text", 0, False, "X"))
 
