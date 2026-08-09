@@ -38,6 +38,35 @@ inputs:
       as $HOST_IP).
     required: false
     default: ""
+  run-as-user:
+    description: >-
+      UID or UID:GID the command runs as inside the container. Defaults to an
+      unprivileged user so a container breakout cannot act as root on the host
+      bind mount. Set to "0:0" only if you truly need root inside the container.
+    required: false
+    default: "1000:1000"
+  project-write:
+    description: >-
+      Mount the shared project directory writable. Defaults to false (read-only)
+      so the container cannot modify host source or drop files into the runner
+      workspace. Set to "true" only when the command must write to /workspace.
+    required: false
+    default: "false"
+  read-only-root:
+    description: >-
+      Mount the container root filesystem read-only (writes go to a small tmpfs
+      at /tmp). Defaults to true. Set to "false" for images that must write
+      outside /tmp/ /workspace (e.g. installing packages at runtime).
+    required: false
+    default: "true"
+  memory:
+    description: "Hard memory limit for the container (e.g. 512m, 2g). Prevents host OOM."
+    required: false
+    default: "2g"
+  cpus:
+    description: "CPU quota for the container (e.g. 1, 1.5, 2)."
+    required: false
+    default: "2"
   issue-title:
     description: "Title for the created issue."
     required: false
@@ -62,8 +91,29 @@ runs:
       shell: bash
       env:
         HOST_PORTS: ${{ inputs.host-ports }}
+        RUN_AS_USER: ${{ inputs.run-as-user }}
+        READ_ONLY_ROOT: ${{ inputs.read-only-root }}
+        MEMORY: ${{ inputs.memory }}
+        CPUS: ${{ inputs.cpus }}
       run: |
         set -euo pipefail
+
+        # --- Validate every value that is later expanded UNQUOTED into the
+        #     `docker run` command line. Without this, an input such as
+        #     "0 --privileged -v /:/host" would inject arbitrary docker flags
+        #     and defeat the whole sandbox.
+        if ! [[ "$RUN_AS_USER" =~ ^[0-9]+(:[0-9]+)?$ ]]; then
+          echo "::error::run-as-user must be UID or UID:GID (digits only): '$RUN_AS_USER'"; exit 1
+        fi
+        if ! [[ "$MEMORY" =~ ^[0-9]+[bkmgBKMG]?$ ]]; then
+          echo "::error::memory must look like 512m / 2g: '$MEMORY'"; exit 1
+        fi
+        if ! [[ "$CPUS" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+          echo "::error::cpus must be numeric: '$CPUS'"; exit 1
+        fi
+        case "$READ_ONLY_ROOT" in true|false) : ;; *)
+          echo "::error::read-only-root must be true or false"; exit 1 ;;
+        esac
 
         NET_NAME="restricted-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${RANDOM}"
         SUBNET="10.173.99.0/24"
@@ -105,11 +155,31 @@ runs:
         done
 
         echo "Allowed host TCP ports: ${PORTS_CLEAN:-<none>}"
+
+        # --- Shared container hardening flags (no value contains spaces, so the
+        #     string can be safely word-split when expanded in the run steps).
+        #     Isolation relied on here:
+        #       * unprivileged user, all capabilities dropped
+        #       * no-new-privileges neutralises setuid binaries on the bind mount
+        #       * private pid/ipc/net namespaces (docker default — host is NOT shared)
+        #       * memory/cpu/pids/fd limits cap the blast radius against the runner
+        DARGS="--user $RUN_AS_USER"
+        DARGS="$DARGS --cap-drop ALL"
+        DARGS="$DARGS --security-opt no-new-privileges"
+        DARGS="$DARGS --pids-limit 512"
+        DARGS="$DARGS --memory $MEMORY --memory-swap $MEMORY"
+        DARGS="$DARGS --cpus $CPUS"
+        DARGS="$DARGS --ulimit nofile=1024:1024"
+        if [ "$READ_ONLY_ROOT" = "true" ]; then
+          DARGS="$DARGS --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m"
+        fi
+
         {
           echo "net-name=$NET_NAME"
           echo "subnet=$SUBNET"
           echo "gateway=$GATEWAY"
           echo "ports=$PORTS_CLEAN"
+          echo "docker-args=$DARGS"
         } >> "$GITHUB_OUTPUT"
 
     - name: Run command in restricted container
@@ -119,8 +189,10 @@ runs:
         IMAGE: ${{ inputs.image }}
         COMMAND: ${{ inputs.command }}
         PROJECT_DIR: ${{ inputs.project-dir }}
+        PROJECT_WRITE: ${{ inputs.project-write }}
         NET_NAME: ${{ steps.net.outputs.net-name }}
         GATEWAY: ${{ steps.net.outputs.gateway }}
+        DOCKER_ARGS: ${{ steps.net.outputs.docker-args }}
       run: |
         set -uo pipefail
 
@@ -128,23 +200,28 @@ runs:
           /*) PROJECT_ABS="$PROJECT_DIR" ;;
           *)  PROJECT_ABS="$GITHUB_WORKSPACE/$PROJECT_DIR" ;;
         esac
+        # Resolve symlinks so the mount cannot be pointed outside the workspace.
+        PROJECT_ABS="$(readlink -f "$PROJECT_ABS")"
         if [ ! -d "$PROJECT_ABS" ]; then
           echo "::error::project-dir '$PROJECT_ABS' does not exist"
           exit 1
         fi
         echo "project-abs=$PROJECT_ABS" >> "$GITHUB_OUTPUT"
 
+        # Read-only bind mount unless the caller explicitly opts into writes.
+        MOUNT_OPT=":ro"
+        [ "$PROJECT_WRITE" = "true" ] && MOUNT_OPT=""
+
         docker pull --quiet "$IMAGE" || true
 
         set +e
+        # shellcheck disable=SC2086  # DOCKER_ARGS is intentionally word-split.
         docker run --rm \
           --network "$NET_NAME" \
           --add-host "host.local:$GATEWAY" \
           --env "HOST_IP=$GATEWAY" \
-          --cap-drop ALL \
-          --security-opt no-new-privileges \
-          --pids-limit 512 \
-          --volume "$PROJECT_ABS:/workspace" \
+          $DOCKER_ARGS \
+          --volume "$PROJECT_ABS:/workspace$MOUNT_OPT" \
           --workdir /workspace \
           "$IMAGE" /bin/sh -c "$COMMAND"
         EXIT_CODE=$?
@@ -162,20 +239,22 @@ runs:
         PROJECT_ABS: ${{ steps.run.outputs.project-abs }}
         NET_NAME: ${{ steps.net.outputs.net-name }}
         GATEWAY: ${{ steps.net.outputs.gateway }}
+        DOCKER_ARGS: ${{ steps.net.outputs.docker-args }}
       run: |
         set -uo pipefail
 
         OUT_FILE="$RUNNER_TEMP/restricted-run-output.log"
 
         set +e
+        # The output command only needs to read the project, so the mount is
+        # always read-only here regardless of project-write.
+        # shellcheck disable=SC2086  # DOCKER_ARGS is intentionally word-split.
         docker run --rm \
           --network "$NET_NAME" \
           --add-host "host.local:$GATEWAY" \
           --env "HOST_IP=$GATEWAY" \
-          --cap-drop ALL \
-          --security-opt no-new-privileges \
-          --pids-limit 512 \
-          --volume "$PROJECT_ABS:/workspace" \
+          $DOCKER_ARGS \
+          --volume "$PROJECT_ABS:/workspace:ro" \
           --workdir /workspace \
           "$IMAGE" /bin/sh -c "$OUTPUT_COMMAND" > "$OUT_FILE" 2>&1
         OUT_EXIT=$?

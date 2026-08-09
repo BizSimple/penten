@@ -16,6 +16,11 @@ combined stdout/stderr is posted as a **new GitHub issue**.
 | `output-command` | yes      | Command run after `command`; its output is posted as an issue. |
 | `github-token`   | yes      | Token with `issues: write`, used to create the issue. |
 | `host-ports`     | no       | Comma-separated host TCP ports the container may reach (e.g. `"5432,8080"`). Empty = no network. |
+| `run-as-user`    | no       | UID or UID:GID the command runs as. Default `1000:1000` (unprivileged). Use `0:0` only if you truly need root. |
+| `project-write`  | no       | Mount `/workspace` writable. Default `false` (read-only). |
+| `read-only-root` | no       | Read-only container root filesystem with a tmpfs `/tmp`. Default `true`. |
+| `memory`         | no       | Hard memory limit (e.g. `512m`, `2g`). Default `2g`. |
+| `cpus`           | no       | CPU quota (e.g. `1`, `1.5`). Default `2`. |
 | `issue-title`    | no       | Title for the created issue. Defaults to a workflow/run label. |
 
 ## Outputs
@@ -34,10 +39,26 @@ combined stdout/stderr is posted as a **new GitHub issue**.
   from that subnet — no internet, no other networks.
 - Host-bound traffic is **default-deny** (`INPUT` drop for the subnet); one
   `ACCEPT` rule per allowed port opens exactly those host TCP ports.
-- The container drops all Linux capabilities (`--cap-drop ALL`), forbids
-  privilege escalation (`--security-opt no-new-privileges`) and is PID-limited.
+- The container drops all Linux capabilities (`--cap-drop ALL`) and forbids
+  privilege escalation (`--security-opt no-new-privileges`), which also
+  neutralises any setuid binary reachable through the bind mount.
+- It runs as an **unprivileged user** (`run-as-user`, default `1000:1000`), with
+  a **read-only root filesystem** (writes go to a 64 MB `noexec` tmpfs at `/tmp`)
+  and the project **mounted read-only** unless `project-write: true`.
+- It uses Docker's default **private pid / ipc / network namespaces** — the host
+  namespaces are never shared (`--pid=host` / `--ipc=host` / `--network=host`
+  are not used), and there is no Docker socket mount.
+- **Memory, CPU, PID and file-descriptor limits** cap the blast radius so a
+  runaway or malicious container cannot exhaust the runner.
+- Inputs that flow into the `docker run` flags (`run-as-user`, `memory`, `cpus`)
+  are strictly validated, preventing extra Docker flags from being injected.
 - Inside the container the host is reachable as **`host.local`** (also exported
   as the `$HOST_IP` environment variable).
+
+> **Data-exposure note:** the *output command's* stdout/stderr is posted to a
+> GitHub issue. Do not run output commands that print secrets, and remember the
+> issue is visible to anyone who can see the repository. The container is never
+> given the `github-token`.
 
 > Requires a Linux runner with `sudo iptables` available (e.g.
 > `ubuntu-latest`). Firewall rules and the network are removed on cleanup,
@@ -58,11 +79,21 @@ jobs:
       - uses: your-org/penten@main
         with:
           image: alpine:3.20
-          command: "apk add --no-cache curl && echo prepared"
+          command: "ls -la /workspace && echo prepared"
           project-dir: .
           output-command: "nc -zv host.local 5432 || echo 'db not reachable'"
           host-ports: "5432"
           github-token: ${{ secrets.GITHUB_TOKEN }}
+```
+
+If your command needs to write to the project or install packages at runtime,
+opt out of the stricter defaults explicitly:
+
+```yaml
+        with:
+          # ...
+          project-write: "true"     # writable /workspace bind mount
+          read-only-root: "false"   # allow apk/apt installs into the image
 ```
 
 See [`.github/workflows/example.yml`](../.github/workflows/example.yml) for a
