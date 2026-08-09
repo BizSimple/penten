@@ -1,0 +1,51 @@
+name: Example — restricted container run
+
+on:
+  workflow_dispatch:
+    inputs:
+      image:
+        description: "Docker image to run"
+        default: "alpine:3.20"
+      command:
+        description: "Command to run inside the container"
+        default: "ls -la /workspace && echo hello from restricted container"
+      output-command:
+        description: "Command whose output is posted as an issue"
+        default: "uname -a && ls /workspace"
+      host-ports:
+        description: "Comma-separated host TCP ports the container may reach"
+        default: "5432"
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  restricted-run:
+    runs-on: ubuntu-latest
+    services:
+      # Example host service the container is allowed to talk to on port 5432.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_PASSWORD: example
+        ports:
+          - 5432:5432
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run in restricted container
+        id: restricted
+        uses: ./
+        with:
+          image: ${{ inputs.image }}
+          command: ${{ inputs.command }}
+          project-dir: .
+          output-command: ${{ inputs.output-command }}
+          host-ports: ${{ inputs.host-ports }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Show created issue
+        run: echo "Issue created at ${{ steps.restricted.outputs.issue-url }}"

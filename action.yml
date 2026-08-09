@@ -1,0 +1,410 @@
+name: "Restricted Container Run"
+description: >-
+  Runs a command line inside a locked-down Docker container that can only reach
+  an allowed set of TCP ports on the host machine. Afterwards runs an output
+  command and posts its output as a new GitHub issue.
+author: "Manoel Carvalho"
+
+branding:
+  icon: "lock"
+  color: "gray-dark"
+
+inputs:
+  image:
+    description: "Docker image name (e.g. alpine:3.20, node:22-slim)."
+    required: true
+  command:
+    description: "Command line executed inside the restricted container (via /bin/sh -c)."
+    required: true
+  project-dir:
+    description: >-
+      Shared project directory mounted into the container at /workspace.
+      Relative paths are resolved against the workspace of the calling workflow.
+      For safety the resolved path (symlinks included) must stay inside
+      $GITHUB_WORKSPACE; paths that escape it are rejected.
+    required: true
+  output-command:
+    description: >-
+      Command line executed (in the same restricted container setup) after the
+      main command. Its combined stdout/stderr is posted as a new issue.
+    required: true
+  github-token:
+    description: "GitHub token with issues:write permission, used to create the issue."
+    required: true
+  host-ports:
+    description: >-
+      Comma-separated list of host TCP ports the container is allowed to reach
+      (e.g. "5432,8080"). Everything else — other host ports, the internet — is
+      blocked, and external DNS resolution is black-holed. Empty means the
+      container has no outbound network access. Inside the container the host is
+      reachable as host.local (also exported as $HOST_IP).
+    required: false
+    default: ""
+  run-as-user:
+    description: >-
+      UID or UID:GID the command runs as inside the container. Defaults to an
+      unprivileged user so a container breakout cannot act as root on the host
+      bind mount. Set to "0:0" only if you truly need root inside the container.
+    required: false
+    default: "1000:1000"
+  project-write:
+    description: >-
+      Mount the shared project directory writable. Defaults to false (read-only)
+      so the container cannot modify host source or drop files into the runner
+      workspace. Set to "true" only when the command must write to /workspace.
+    required: false
+    default: "false"
+  read-only-root:
+    description: >-
+      Mount the container root filesystem read-only (writes go to a small tmpfs
+      at /tmp). Defaults to true. Set to "false" for images that must write
+      outside /tmp/ /workspace (e.g. installing packages at runtime).
+    required: false
+    default: "true"
+  memory:
+    description: "Hard memory limit for the container (e.g. 512m, 2g). Prevents host OOM."
+    required: false
+    default: "2g"
+  cpus:
+    description: "CPU quota for the container (e.g. 1, 1.5, 2)."
+    required: false
+    default: "2"
+  issue-title:
+    description: "Title for the created issue."
+    required: false
+    default: ""
+
+outputs:
+  issue-url:
+    description: "URL of the created issue."
+    value: ${{ steps.issue.outputs.issue-url }}
+  issue-number:
+    description: "Number of the created issue."
+    value: ${{ steps.issue.outputs.issue-number }}
+  exit-code:
+    description: "Exit code of the main command."
+    value: ${{ steps.run.outputs.exit-code }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Set up restricted network
+      id: net
+      shell: bash
+      env:
+        HOST_PORTS: ${{ inputs.host-ports }}
+        RUN_AS_USER: ${{ inputs.run-as-user }}
+        READ_ONLY_ROOT: ${{ inputs.read-only-root }}
+        MEMORY: ${{ inputs.memory }}
+        CPUS: ${{ inputs.cpus }}
+      run: |
+        set -euo pipefail
+
+        # --- Validate every value that is later expanded UNQUOTED into the
+        #     `docker run` command line. Without this, an input such as
+        #     "0 --privileged -v /:/host" would inject arbitrary docker flags
+        #     and defeat the whole sandbox.
+        if ! [[ "$RUN_AS_USER" =~ ^[0-9]+(:[0-9]+)?$ ]]; then
+          echo "::error::run-as-user must be UID or UID:GID (digits only): '$RUN_AS_USER'"; exit 1
+        fi
+        if ! [[ "$MEMORY" =~ ^[0-9]+[bkmgBKMG]?$ ]]; then
+          echo "::error::memory must look like 512m / 2g: '$MEMORY'"; exit 1
+        fi
+        if ! [[ "$CPUS" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+          echo "::error::cpus must be numeric: '$CPUS'"; exit 1
+        fi
+        case "$READ_ONLY_ROOT" in true|false) : ;; *)
+          echo "::error::read-only-root must be true or false"; exit 1 ;;
+        esac
+
+        NET_NAME="restricted-${GITHUB_RUN_ID:-local}-${GITHUB_RUN_ATTEMPT:-0}-${RANDOM}"
+
+        # Emit the network name BEFORE touching iptables so the always()-cleanup
+        # step can find and remove rules even if this step fails partway.
+        echo "net-name=$NET_NAME" >> "$GITHUB_OUTPUT"
+
+        # Dedicated bridge network so firewall rules only affect this container.
+        # Let Docker allocate the subnet/gateway (a fixed subnet collides with
+        # other networks on shared/self-hosted runners and could open host ports
+        # to the wrong containers).
+        docker network create \
+          --driver bridge \
+          --opt com.docker.network.bridge.enable_icc=false \
+          "$NET_NAME"
+
+        SUBNET="$(docker network inspect -f '{{(index .IPAM.Config 0).Subnet}}' "$NET_NAME")"
+        GATEWAY="$(docker network inspect -f '{{(index .IPAM.Config 0).Gateway}}' "$NET_NAME")"
+        if [ -z "$SUBNET" ] || [ -z "$GATEWAY" ]; then
+          echo "::error::could not determine subnet/gateway for network $NET_NAME"; exit 1
+        fi
+        echo "Allocated subnet $SUBNET (gateway $GATEWAY)"
+
+        # Make sure the DOCKER-USER chain exists (Docker consults it for all
+        # forwarded container traffic). Every rule we add is tagged with the
+        # network name so cleanup can delete exactly our rules by comment.
+        if ! sudo iptables -nL DOCKER-USER >/dev/null 2>&1; then
+          sudo iptables -N DOCKER-USER
+          sudo iptables -I FORWARD -j DOCKER-USER
+        fi
+
+        # 1) No forwarded egress at all: the container cannot reach the
+        #    internet or other networks.
+        sudo iptables -I DOCKER-USER -s "$SUBNET" -m comment --comment "$NET_NAME" -j DROP
+
+        # 2) Traffic from the container to the host itself goes through INPUT.
+        #    Default-deny it, then punch holes only for the allowed TCP ports.
+        sudo iptables -I INPUT 1 -s "$SUBNET" -m comment --comment "$NET_NAME" -j DROP
+
+        PORTS_CLEAN=""
+        IFS=', ' read -r -a PORTS <<< "${HOST_PORTS}"
+        for PORT in "${PORTS[@]}"; do
+          [ -z "$PORT" ] && continue
+          if ! [[ "$PORT" =~ ^[0-9]+$ ]] || [ "$PORT" -lt 1 ] || [ "$PORT" -gt 65535 ]; then
+            echo "::error::Invalid host port: '$PORT'"
+            exit 1
+          fi
+          sudo iptables -I INPUT 1 -s "$SUBNET" -p tcp --dport "$PORT" \
+            -m comment --comment "$NET_NAME" -j ACCEPT
+          PORTS_CLEAN="${PORTS_CLEAN}${PORTS_CLEAN:+ }${PORT}"
+        done
+
+        echo "Allowed host TCP ports: ${PORTS_CLEAN:-<none>}"
+
+        # --- Shared container hardening flags (no value contains spaces, so the
+        #     string can be safely word-split when expanded in the run steps).
+        #     Isolation relied on here:
+        #       * unprivileged user, all capabilities dropped
+        #       * no-new-privileges neutralises setuid binaries on the bind mount
+        #       * private pid/ipc/net namespaces (docker default — host is NOT shared)
+        #       * memory/cpu/pids/fd limits cap the blast radius against the runner
+        #       * --dns 0.0.0.0 black-holes external name resolution. Docker's
+        #         embedded resolver (127.0.0.11) is served from the host netns and
+        #         so bypasses the iptables egress drop; without this it is a DNS
+        #         exfiltration channel even when host-ports is empty. Internal
+        #         name lookups and host.local (/etc/hosts) are unaffected.
+        DARGS="--user $RUN_AS_USER"
+        DARGS="$DARGS --cap-drop ALL"
+        DARGS="$DARGS --security-opt no-new-privileges"
+        DARGS="$DARGS --dns 0.0.0.0"
+        DARGS="$DARGS --pids-limit 512"
+        DARGS="$DARGS --memory $MEMORY --memory-swap $MEMORY"
+        DARGS="$DARGS --cpus $CPUS"
+        DARGS="$DARGS --ulimit nofile=1024:1024"
+        if [ "$READ_ONLY_ROOT" = "true" ]; then
+          DARGS="$DARGS --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m"
+        fi
+
+        {
+          echo "subnet=$SUBNET"
+          echo "gateway=$GATEWAY"
+          echo "ports=$PORTS_CLEAN"
+          echo "docker-args=$DARGS"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Run command in restricted container
+      id: run
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        COMMAND: ${{ inputs.command }}
+        PROJECT_DIR: ${{ inputs.project-dir }}
+        PROJECT_WRITE: ${{ inputs.project-write }}
+        NET_NAME: ${{ steps.net.outputs.net-name }}
+        GATEWAY: ${{ steps.net.outputs.gateway }}
+        DOCKER_ARGS: ${{ steps.net.outputs.docker-args }}
+      run: |
+        set -uo pipefail
+
+        case "$PROJECT_DIR" in
+          /*) PROJECT_ABS="$PROJECT_DIR" ;;
+          *)  PROJECT_ABS="$GITHUB_WORKSPACE/$PROJECT_DIR" ;;
+        esac
+        # Resolve symlinks, THEN confine the result to the workspace. readlink -f
+        # only canonicalises; it does not contain. Without the case check below,
+        # project-dir: / or ../../home/runner (or a symlink committed in the repo)
+        # would bind-mount host paths — SSH keys, docker/config.json, cloud creds
+        # — into the container, and output-command posts straight to an issue.
+        PROJECT_ABS="$(readlink -f "$PROJECT_ABS")"
+        WS_ABS="$(readlink -f "$GITHUB_WORKSPACE")"
+        case "$PROJECT_ABS" in
+          "$WS_ABS"|"$WS_ABS"/*) : ;;
+          *) echo "::error::project-dir must resolve inside \$GITHUB_WORKSPACE ($WS_ABS); got '$PROJECT_ABS'"; exit 1 ;;
+        esac
+        if [ ! -d "$PROJECT_ABS" ]; then
+          echo "::error::project-dir '$PROJECT_ABS' does not exist"
+          exit 1
+        fi
+        echo "project-abs=$PROJECT_ABS" >> "$GITHUB_OUTPUT"
+
+        # Read-only bind mount unless the caller explicitly opts into writes.
+        MOUNT_OPT=":ro"
+        [ "$PROJECT_WRITE" = "true" ] && MOUNT_OPT=""
+
+        # A pull failure must not be silently ignored, but a locally-built image
+        # (not in any registry) is still valid — so warn on pull failure and
+        # only hard-fail if the image is absent afterwards.
+        docker pull --quiet "$IMAGE" \
+          || echo "::warning::could not pull '$IMAGE'; will use a local image if present"
+        if ! docker image inspect "$IMAGE" >/dev/null 2>&1; then
+          echo "::error::image '$IMAGE' is not available locally or from the registry"
+          exit 1
+        fi
+
+        set +e
+        # shellcheck disable=SC2086  # DOCKER_ARGS is intentionally word-split.
+        docker run --rm \
+          --network "$NET_NAME" \
+          --add-host "host.local:$GATEWAY" \
+          --env "HOST_IP=$GATEWAY" \
+          $DOCKER_ARGS \
+          --volume "$PROJECT_ABS:/workspace$MOUNT_OPT" \
+          --workdir /workspace \
+          "$IMAGE" /bin/sh -c "$COMMAND"
+        EXIT_CODE=$?
+        set -e
+
+        echo "exit-code=$EXIT_CODE" >> "$GITHUB_OUTPUT"
+        echo "Main command exited with code $EXIT_CODE"
+
+    - name: Run output command and capture result
+      id: output
+      shell: bash
+      env:
+        IMAGE: ${{ inputs.image }}
+        OUTPUT_COMMAND: ${{ inputs.output-command }}
+        PROJECT_ABS: ${{ steps.run.outputs.project-abs }}
+        NET_NAME: ${{ steps.net.outputs.net-name }}
+        GATEWAY: ${{ steps.net.outputs.gateway }}
+        DOCKER_ARGS: ${{ steps.net.outputs.docker-args }}
+      run: |
+        set -uo pipefail
+
+        OUT_FILE="$RUNNER_TEMP/restricted-run-output.log"
+
+        set +e
+        # The output command only needs to read the project, so the mount is
+        # always read-only here regardless of project-write.
+        # shellcheck disable=SC2086  # DOCKER_ARGS is intentionally word-split.
+        docker run --rm \
+          --network "$NET_NAME" \
+          --add-host "host.local:$GATEWAY" \
+          --env "HOST_IP=$GATEWAY" \
+          $DOCKER_ARGS \
+          --volume "$PROJECT_ABS:/workspace:ro" \
+          --workdir /workspace \
+          "$IMAGE" /bin/sh -c "$OUTPUT_COMMAND" > "$OUT_FILE" 2>&1
+        OUT_EXIT=$?
+        set -e
+
+        echo "--- output command (exit $OUT_EXIT) ---"
+        cat "$OUT_FILE"
+        echo "out-file=$OUT_FILE" >> "$GITHUB_OUTPUT"
+        echo "out-exit=$OUT_EXIT" >> "$GITHUB_OUTPUT"
+
+    - name: Post output as new issue
+      id: issue
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token }}
+        ISSUE_TITLE: ${{ inputs.issue-title }}
+        IMAGE: ${{ inputs.image }}
+        OUTPUT_COMMAND: ${{ inputs.output-command }}
+        OUT_FILE: ${{ steps.output.outputs.out-file }}
+        OUT_EXIT: ${{ steps.output.outputs.out-exit }}
+        MAIN_EXIT: ${{ steps.run.outputs.exit-code }}
+        ALLOWED_PORTS: ${{ steps.net.outputs.ports }}
+      run: |
+        set -euo pipefail
+
+        TITLE="$ISSUE_TITLE"
+        if [ -z "$TITLE" ]; then
+          TITLE="Restricted container output — ${GITHUB_WORKFLOW} #${GITHUB_RUN_NUMBER}"
+        fi
+
+        # Issue bodies max out at 65536 chars; keep headroom for the wrapper.
+        MAX_BYTES=60000
+        OUTPUT_CONTENT="$(head -c "$MAX_BYTES" "$OUT_FILE")"
+        TRUNC_NOTE=""
+        if [ "$(wc -c < "$OUT_FILE")" -gt "$MAX_BYTES" ]; then
+          TRUNC_NOTE=$'\n\n> **Note:** output was truncated to fit the issue body limit.'
+        fi
+
+        RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+        # Choose a code fence longer than the longest backtick run in the output
+        # so the content cannot break out of the fence and inject markdown into
+        # the issue. Preserves the output exactly (no character substitution).
+        MAXTICKS="$(printf '%s' "$OUTPUT_CONTENT" | grep -aoE '`+' | awk '{ if (length>m) m=length } END { print m+0 }')"
+        FENCELEN=$(( MAXTICKS + 1 ))
+        [ "$FENCELEN" -lt 3 ] && FENCELEN=3
+        FENCE="$(printf '%*s' "$FENCELEN" '' | tr ' ' '`')"
+
+        BODY="$(jq -n \
+          --arg image "$IMAGE" \
+          --arg cmd "$OUTPUT_COMMAND" \
+          --arg out "$OUTPUT_CONTENT" \
+          --arg fence "$FENCE" \
+          --arg mainexit "$MAIN_EXIT" \
+          --arg outexit "$OUT_EXIT" \
+          --arg ports "${ALLOWED_PORTS:-<none>}" \
+          --arg runurl "$RUN_URL" \
+          --arg trunc "$TRUNC_NOTE" \
+          '"## Restricted container run\n\n" +
+           "| | |\n|---|---|\n" +
+           "| Image | `\($image)` |\n" +
+           "| Allowed host ports | `\($ports)` |\n" +
+           "| Main command exit code | `\($mainexit)` |\n" +
+           "| Output command exit code | `\($outexit)` |\n" +
+           "| Workflow run | \($runurl) |\n\n" +
+           "### Output of `\($cmd | gsub("`"; "ˋ"))`\n\n" +
+           $fence + "\n" + $out + "\n" + $fence + $trunc')"
+
+        RESPONSE="$(jq -n --arg title "$TITLE" --argjson body "$BODY" \
+            '{title: $title, body: $body}' \
+          | curl -sS --fail-with-body \
+              -X POST \
+              -H "Authorization: Bearer $GH_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/issues" \
+              -d @-)"
+
+        ISSUE_URL="$(echo "$RESPONSE" | jq -r '.html_url')"
+        ISSUE_NUMBER="$(echo "$RESPONSE" | jq -r '.number')"
+        echo "Created issue: $ISSUE_URL"
+        echo "issue-url=$ISSUE_URL" >> "$GITHUB_OUTPUT"
+        echo "issue-number=$ISSUE_NUMBER" >> "$GITHUB_OUTPUT"
+
+    - name: Clean up network and firewall rules
+      if: always()
+      shell: bash
+      env:
+        NET_NAME: ${{ steps.net.outputs.net-name }}
+      run: |
+        set +e
+        [ -z "${NET_NAME:-}" ] && exit 0
+
+        # Delete every rule tagged with this network's comment, in both chains,
+        # by line number. This removes our rules regardless of how far setup got
+        # (no dependency on the ports/subnet outputs, which may not exist if the
+        # setup step failed after inserting rules).
+        for CHAIN in INPUT DOCKER-USER; do
+          while :; do
+            LINE="$(sudo iptables -L "$CHAIN" --line-numbers -n 2>/dev/null \
+              | awk -v tag="$NET_NAME" 'index($0, tag) {print $1; exit}')"
+            [ -z "$LINE" ] && break
+            sudo iptables -D "$CHAIN" "$LINE" || break
+          done
+        done
+
+        docker network rm "$NET_NAME" >/dev/null 2>&1
+        exit 0
+
+    - name: Fail if main command failed
+      if: steps.run.outputs.exit-code != '0'
+      shell: bash
+      env:
+        MAIN_EXIT: ${{ steps.run.outputs.exit-code }}
+      run: |
+        echo "::error::Main command failed with exit code $MAIN_EXIT (output was still posted as an issue)"
+        exit "$MAIN_EXIT"
