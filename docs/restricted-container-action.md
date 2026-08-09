@@ -2,9 +2,10 @@
 
 A composite action that runs a command inside a **locked-down Docker container**.
 The container is isolated on its own bridge network and, by default, has **no
-network access at all** — you explicitly allow a specific set of **host TCP
-ports** it may reach. After the main command, an *output command* runs and its
-combined stdout/stderr is posted as a **new GitHub issue**.
+outbound network access** (external DNS included) — you explicitly allow a
+specific set of **host TCP ports** it may reach. After the main command, an
+*output command* runs and its combined stdout/stderr is posted as a **new GitHub
+issue**.
 
 ## Inputs
 
@@ -33,18 +34,31 @@ combined stdout/stderr is posted as a **new GitHub issue**.
 
 ## How the restriction works
 
-- The container runs on a **dedicated bridge network** with inter-container
-  communication disabled (`enable_icc=false`).
+- The container runs on a **dedicated bridge network** (subnet allocated by
+  Docker, so concurrent jobs never collide) with inter-container communication
+  disabled (`enable_icc=false`).
 - An `iptables` rule in the `DOCKER-USER` chain **drops all forwarded egress**
-  from that subnet — no internet, no other networks.
+  from that subnet — no internet, no other networks. Every rule is tagged with
+  the network name and removed by that tag on cleanup.
+- **External DNS is black-holed** (`--dns 0.0.0.0`). Docker's embedded resolver
+  runs in the host network namespace and so bypasses the egress drop; without
+  this it is a data-exfiltration channel even with `host-ports` empty. Internal
+  name lookups and `host.local` (`/etc/hosts`) still work.
 - Host-bound traffic is **default-deny** (`INPUT` drop for the subnet); one
   `ACCEPT` rule per allowed port opens exactly those host TCP ports.
 - The container drops all Linux capabilities (`--cap-drop ALL`) and forbids
-  privilege escalation (`--security-opt no-new-privileges`), which also
-  neutralises any setuid binary reachable through the bind mount.
+  privilege escalation (`--security-opt no-new-privileges`). Because
+  `CAP_DAC_OVERRIDE` is dropped, even `run-as-user: "0:0"` (root inside the
+  container) is still subject to normal file-permission checks on the bind
+  mount — root inside is **not** root on the host — and any setuid binary
+  reachable through the mount is neutralised.
 - It runs as an **unprivileged user** (`run-as-user`, default `1000:1000`), with
   a **read-only root filesystem** (writes go to a 64 MB `noexec` tmpfs at `/tmp`)
   and the project **mounted read-only** unless `project-write: true`.
+- The resolved `project-dir` (symlinks included) must stay **inside
+  `$GITHUB_WORKSPACE`**; paths that escape it (`/`, `../..`, a symlink to
+  `/home/runner`) are rejected, so host credentials and caches cannot be mounted
+  into the container.
 - It uses Docker's default **private pid / ipc / network namespaces** — the host
   namespaces are never shared (`--pid=host` / `--ipc=host` / `--network=host`
   are not used), and there is no Docker socket mount.
@@ -63,6 +77,20 @@ combined stdout/stderr is posted as a **new GitHub issue**.
 > Requires a Linux runner with `sudo iptables` available (e.g.
 > `ubuntu-latest`). Firewall rules and the network are removed on cleanup,
 > even if earlier steps fail.
+
+### Operational guidance for self-hosted runners
+
+- This action edits the host's `INPUT` chain. Prefer **ephemeral runners**; on a
+  long-lived runner the cleanup removes only this run's tagged rules, but a
+  crashed runner could still leave rules behind.
+- **Never** mount the Docker socket (`/var/run/docker.sock`) into the container —
+  it is equivalent to host root and defeats every control here.
+- Keep `project-write: "true"` off unless a step truly needs it: a writable
+  checkout combined with any later step that executes repo content is host code
+  execution.
+- **Pin images by digest** for untrusted or supply-chain-sensitive use, e.g.
+  `alpine:3.20@sha256:…` — a bare tag like `alpine:3.20` is mutable and can be
+  repointed at a different image.
 
 ## Usage
 
