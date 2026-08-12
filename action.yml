@@ -84,6 +84,9 @@ outputs:
   exit-code:
     description: "Exit code of the main command."
     value: ${{ steps.run.outputs.exit-code }}
+  out-exit-code:
+    description: "Exit code of the output command."
+    value: ${{ steps.output.outputs.out-exit }}
 
 runs:
   using: "composite"
@@ -334,7 +337,16 @@ runs:
         # Choose a code fence longer than the longest backtick run in the output
         # so the content cannot break out of the fence and inject markdown into
         # the issue. Preserves the output exactly (no character substitution).
-        MAXTICKS="$(printf '%s' "$OUTPUT_CONTENT" | grep -aoE '`+' | awk '{ if (length>m) m=length } END { print m+0 }')"
+        # Use awk only — `grep` exits 1 when there are no backticks, and under
+        # `set -o pipefail` that aborted this step before the issue was created
+        # (see BizSimple/saas-templates#143).
+        MAXTICKS="$(printf '%s' "$OUTPUT_CONTENT" | awk '{
+          s=$0
+          while (match(s, /`+/)) {
+            if (RLENGTH > m) m = RLENGTH
+            s = substr(s, RSTART + RLENGTH)
+          }
+        } END { print m+0 }')"
         FENCELEN=$(( MAXTICKS + 1 ))
         [ "$FENCELEN" -lt 3 ] && FENCELEN=3
         FENCE="$(printf '%*s' "$FENCELEN" '' | tr ' ' '`')"
@@ -408,3 +420,12 @@ runs:
       run: |
         echo "::error::Main command failed with exit code $MAIN_EXIT (output was still posted as an issue)"
         exit "$MAIN_EXIT"
+
+    - name: Fail if output command failed
+      if: steps.run.outputs.exit-code == '0' && steps.output.outputs.out-exit != '0'
+      shell: bash
+      env:
+        OUT_EXIT: ${{ steps.output.outputs.out-exit }}
+      run: |
+        echo "::error::Output command failed with exit code $OUT_EXIT (output was still posted as an issue)"
+        exit "$OUT_EXIT"
